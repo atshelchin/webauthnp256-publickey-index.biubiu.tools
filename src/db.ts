@@ -33,6 +33,12 @@ export function initDb(path = "data.db"): Database {
     )
   `);
 
+  // Migration: add name column if missing (for databases created before this field existed)
+  const columns = db.prepare("PRAGMA table_info(public_keys)").all() as { name: string }[];
+  if (!columns.some((c) => c.name === "name")) {
+    db.exec("ALTER TABLE public_keys ADD COLUMN name TEXT NOT NULL DEFAULT ''");
+  }
+
   return db;
 }
 
