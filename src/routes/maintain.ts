@@ -1,3 +1,4 @@
+import { S3Client } from "bun";
 import { backupToFile, mergeFromBackup } from "../db.ts";
 import { cacheClear } from "../cache.ts";
 
@@ -7,47 +8,26 @@ function getEnv(key: string): string {
   return value;
 }
 
-async function uploadToR2(filePath: string, key: string): Promise<string> {
-  const endpoint = getEnv("R2_ENDPOINT");
-  const accessKeyId = getEnv("R2_ACCESS_KEY_ID");
-  const secretAccessKey = getEnv("R2_SECRET_ACCESS_KEY");
-  const bucket = getEnv("R2_BUCKET");
-
-  const file = Bun.file(filePath);
-  const body = await file.arrayBuffer();
-  const url = `${endpoint}/${bucket}/${key}`;
-
-  const response = await fetch(url, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
-    },
-    body,
-    // @ts-expect-error Bun supports aws option for S3-compatible signing
-    aws: { accessKeyId, secretAccessKey, service: "s3" },
+function getS3Client(): S3Client {
+  return new S3Client({
+    endpoint: getEnv("R2_ENDPOINT"),
+    accessKeyId: getEnv("R2_ACCESS_KEY_ID"),
+    secretAccessKey: getEnv("R2_SECRET_ACCESS_KEY"),
+    bucket: getEnv("R2_BUCKET"),
   });
+}
 
-  if (!response.ok) {
-    throw new Error(`R2 upload failed: ${response.status} ${await response.text()}`);
-  }
-
+async function uploadToR2(filePath: string, key: string): Promise<string> {
+  const s3 = getS3Client();
+  const data = await Bun.file(filePath).arrayBuffer();
+  await s3.write(key, data);
   const publicUrl = getEnv("R2_PUBLIC_URL");
   return `${publicUrl}/${key}`;
 }
 
 async function deleteFromR2(key: string): Promise<void> {
-  const endpoint = getEnv("R2_ENDPOINT");
-  const accessKeyId = getEnv("R2_ACCESS_KEY_ID");
-  const secretAccessKey = getEnv("R2_SECRET_ACCESS_KEY");
-  const bucket = getEnv("R2_BUCKET");
-
-  const url = `${endpoint}/${bucket}/${key}`;
-  await fetch(url, {
-    method: "DELETE",
-    // @ts-expect-error Bun supports aws option
-    aws: { accessKeyId, secretAccessKey, service: "s3" },
-  });
+  const s3 = getS3Client();
+  await s3.delete(key);
 }
 
 async function sendTelegramMessage(message: string): Promise<void> {
