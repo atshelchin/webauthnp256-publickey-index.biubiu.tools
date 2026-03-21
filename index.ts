@@ -2,7 +2,7 @@ import { initDb } from "./src/db.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge, handleCreate } from "./src/routes/create.ts";
 import { handleListRpIds, handleListPublicKeys } from "./src/routes/stats.ts";
-import { handleBackup, handleRestore } from "./src/routes/maintain.ts";
+import { handleBackup, handleRestore, startAutoBackup } from "./src/routes/maintain.ts";
 import HOME_HTML from "./src/index.html" with { type: "text" };
 
 initDb(process.env.DB_PATH || "data.db");
@@ -66,5 +66,6 @@ const server = Bun.serve({
 });
 
 console.log(`Server running at http://localhost:${server.port}`);
+startAutoBackup();
 
 export { server };
