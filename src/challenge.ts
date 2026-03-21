@@ -53,7 +53,8 @@ export function verifyWebAuthnSignature(
     // 3. Verify signature
     const sigBytes = hexToBytes(signatureHex);
     const pubBytes = hexToBytes(publicKeyHex);
-    return p256.verify(sigBytes, signedData, pubBytes);
+    // WebAuthn authenticators may produce high-S signatures, so disable lowS check
+    return p256.verify(sigBytes, signedData, pubBytes, { lowS: false });
   } catch {
     return false;
   }
