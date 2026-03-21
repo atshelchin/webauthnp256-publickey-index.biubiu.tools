@@ -1,0 +1,22 @@
+{
+  "name": "webauthnp256-publickey-index.biubiu.tools",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "test": "bun test",
+    "build:exe": "bun run build.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "marked": "^17.0.5"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1"
+  }
+}
