@@ -27,6 +27,7 @@ export function initDb(path = "data.db"): Database {
       rpId TEXT NOT NULL REFERENCES rp_ids(rpId),
       credentialId TEXT NOT NULL,
       publicKey TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
       createdAt INTEGER NOT NULL,
       PRIMARY KEY (rpId, credentialId)
     )
@@ -43,19 +44,20 @@ export function setDb(newDb: Database) {
 
 export function getPublicKey(rpId: string, credentialId: string) {
   const stmt = getDb().prepare(
-    "SELECT rpId, credentialId, publicKey, createdAt FROM public_keys WHERE rpId = ? AND credentialId = ?"
+    "SELECT rpId, credentialId, publicKey, name, createdAt FROM public_keys WHERE rpId = ? AND credentialId = ?"
   );
   return stmt.get(rpId, credentialId) as {
     rpId: string;
     credentialId: string;
     publicKey: string;
+    name: string;
     createdAt: number;
   } | null;
 }
 
 // --- Create ---
 
-export function createPublicKey(rpId: string, credentialId: string, publicKey: string): { rpId: string; credentialId: string; publicKey: string; createdAt: number } {
+export function createPublicKey(rpId: string, credentialId: string, publicKey: string, name = ""): { rpId: string; credentialId: string; publicKey: string; name: string; createdAt: number } {
   const now = Date.now();
   const d = getDb();
 
@@ -65,12 +67,12 @@ export function createPublicKey(rpId: string, credentialId: string, publicKey: s
   }
 
   d.prepare(
-    "INSERT INTO public_keys (rpId, credentialId, publicKey, createdAt) VALUES (?, ?, ?, ?)"
-  ).run(rpId, credentialId, publicKey, now);
+    "INSERT INTO public_keys (rpId, credentialId, publicKey, name, createdAt) VALUES (?, ?, ?, ?, ?)"
+  ).run(rpId, credentialId, publicKey, name, now);
 
   d.prepare("UPDATE rp_ids SET publicKeyCount = publicKeyCount + 1 WHERE rpId = ?").run(rpId);
 
-  return { rpId, credentialId, publicKey, createdAt: now };
+  return { rpId, credentialId, publicKey, name, createdAt: now };
 }
 
 // --- Stats ---
@@ -88,8 +90,8 @@ export function listPublicKeysByRpId(rpId: string, page: number, pageSize: numbe
   const offset = (page - 1) * pageSize;
   const total = (getDb().prepare("SELECT COUNT(*) as count FROM public_keys WHERE rpId = ?").get(rpId) as { count: number }).count;
   const items = getDb()
-    .prepare(`SELECT rpId, credentialId, publicKey, createdAt FROM public_keys WHERE rpId = ? ORDER BY createdAt ${order === "asc" ? "ASC" : "DESC"} LIMIT ? OFFSET ?`)
-    .all(rpId, pageSize, offset) as { rpId: string; credentialId: string; publicKey: string; createdAt: number }[];
+    .prepare(`SELECT rpId, credentialId, publicKey, name, createdAt FROM public_keys WHERE rpId = ? ORDER BY createdAt ${order === "asc" ? "ASC" : "DESC"} LIMIT ? OFFSET ?`)
+    .all(rpId, pageSize, offset) as { rpId: string; credentialId: string; publicKey: string; name: string; createdAt: number }[];
   return { total, page, pageSize, items };
 }
 
@@ -106,7 +108,7 @@ export function mergeFromBackup(backupPath: string) {
   const d = getDb();
 
   const insertRp = d.prepare("INSERT OR IGNORE INTO rp_ids (rpId, publicKeyCount, createdAt) VALUES (?, 0, ?)");
-  const insertPk = d.prepare("INSERT OR IGNORE INTO public_keys (rpId, credentialId, publicKey, createdAt) VALUES (?, ?, ?, ?)");
+  const insertPk = d.prepare("INSERT OR IGNORE INTO public_keys (rpId, credentialId, publicKey, name, createdAt) VALUES (?, ?, ?, ?, ?)");
   const updateCount = d.prepare("UPDATE rp_ids SET publicKeyCount = (SELECT COUNT(*) FROM public_keys WHERE rpId = ?) WHERE rpId = ?");
 
   const transaction = d.transaction(() => {
@@ -114,13 +116,13 @@ export function mergeFromBackup(backupPath: string) {
       insertRp.run(rp.rpId, rp.createdAt);
     }
 
-    const publicKeys = backupDb.prepare("SELECT rpId, credentialId, publicKey, createdAt FROM public_keys").all() as {
-      rpId: string; credentialId: string; publicKey: string; createdAt: number;
+    const publicKeys = backupDb.prepare("SELECT rpId, credentialId, publicKey, name, createdAt FROM public_keys").all() as {
+      rpId: string; credentialId: string; publicKey: string; name: string; createdAt: number;
     }[];
 
     const affectedRpIds = new Set<string>();
     for (const pk of publicKeys) {
-      insertPk.run(pk.rpId, pk.credentialId, pk.publicKey, pk.createdAt);
+      insertPk.run(pk.rpId, pk.credentialId, pk.publicKey, pk.name, pk.createdAt);
       affectedRpIds.add(pk.rpId);
     }
 
