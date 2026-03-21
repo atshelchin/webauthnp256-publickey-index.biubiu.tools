@@ -30,6 +30,13 @@ async function deleteFromR2(key: string): Promise<void> {
   await s3.delete(key);
 }
 
+async function listR2Keys(prefix: string): Promise<string[]> {
+  const s3 = getS3Client();
+  const result = await s3.list({ prefix });
+  const keys = (result.contents ?? []).map((item) => item.key);
+  return keys.sort();
+}
+
 async function sendTelegramMessage(message: string): Promise<void> {
   const botToken = getEnv("TELEGRAM_BOT_TOKEN");
   const chatId = getEnv("TELEGRAM_CHAT_ID");
@@ -41,43 +48,77 @@ async function sendTelegramMessage(message: string): Promise<void> {
   });
 }
 
-let lastBackupKey: string | null = null;
+// --- Admin API Key ---
+
+export function verifyAdminKey(req: Request): boolean {
+  const key = req.headers.get("X-Admin-Key");
+  const expected = process.env.ADMIN_API_KEY;
+  if (!expected) return false;
+  return key === expected;
+}
+
+// --- Backup retention ---
+
+const HOURLY_KEEP = 24;
+const DAILY_KEEP = 7;
 const BACKUP_INTERVAL = 60 * 60 * 1000; // 1 hour
 
+async function cleanupOldBackups(prefix: string, keep: number): Promise<void> {
+  const keys = await listR2Keys(prefix);
+  if (keys.length <= keep) return;
+  const toDelete = keys.slice(0, keys.length - keep);
+  for (const key of toDelete) {
+    await deleteFromR2(key).catch(() => {});
+  }
+}
+
 export function startAutoBackup() {
-  setInterval(async () => {
-    console.log("[auto-backup] Starting scheduled backup...");
-    const res = await handleBackup();
-    const body = await res.json();
-    if (body.success) {
-      console.log(`[auto-backup] Success: ${body.url}`);
-    } else {
-      console.error(`[auto-backup] Failed: ${body.error}`);
-    }
+  // Run first backup shortly after start (10 seconds)
+  setTimeout(() => {
+    performBackup().catch((err) => console.error("[auto-backup] Initial backup failed:", err));
+  }, 10_000);
+
+  setInterval(() => {
+    performBackup().catch((err) => console.error("[auto-backup] Failed:", err));
   }, BACKUP_INTERVAL);
   console.log("[auto-backup] Scheduled every 1 hour");
 }
 
+async function performBackup(): Promise<void> {
+  console.log("[auto-backup] Starting scheduled backup...");
+  const res = await handleBackup();
+  const body = await res.json();
+  if (body.success) {
+    console.log(`[auto-backup] Success: ${body.url}`);
+  } else {
+    console.error(`[auto-backup] Failed: ${body.error}`);
+  }
+}
+
 export async function handleBackup(): Promise<Response> {
   try {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const now = new Date();
+    const timestamp = now.toISOString().replace(/[:.]/g, "-");
     const backupFileName = `backup-${timestamp}.db`;
     const backupPath = `./backups/${backupFileName}`;
-    const r2Key = `backups/${backupFileName}`;
 
     await Bun.$`mkdir -p ./backups`;
     backupToFile(backupPath);
 
-    const downloadUrl = await uploadToR2(backupPath, r2Key);
+    // Upload hourly backup
+    const hourlyKey = `backups/hourly/${backupFileName}`;
+    const downloadUrl = await uploadToR2(backupPath, hourlyKey);
 
-    // Delete old backup from R2
-    if (lastBackupKey && lastBackupKey !== r2Key) {
-      await deleteFromR2(lastBackupKey).catch(() => {});
-    }
-    lastBackupKey = r2Key;
+    // Upload daily backup (one per day, keyed by date)
+    const dailyKey = `backups/daily/backup-${now.toISOString().slice(0, 10)}.db`;
+    await uploadToR2(backupPath, dailyKey);
 
-    // Clean up local backup file
+    // Clean up local file
     await Bun.$`rm -f ${backupPath}`;
+
+    // Retention: keep last 24 hourly, last 7 daily
+    await cleanupOldBackups("backups/hourly/", HOURLY_KEEP).catch(() => {});
+    await cleanupOldBackups("backups/daily/", DAILY_KEEP).catch(() => {});
 
     // Notify via Telegram
     await sendTelegramMessage(`✅ Backup completed\n📥 ${downloadUrl}`).catch(() => {});

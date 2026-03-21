@@ -2,7 +2,7 @@ import { initDb } from "./src/db.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge, handleCreate } from "./src/routes/create.ts";
 import { handleListRpIds, handleListPublicKeys } from "./src/routes/stats.ts";
-import { handleBackup, handleRestore, startAutoBackup } from "./src/routes/maintain.ts";
+import { handleBackup, handleRestore, startAutoBackup, verifyAdminKey } from "./src/routes/maintain.ts";
 import HOME_HTML from "./src/index.html" with { type: "text" };
 
 initDb(process.env.DB_PATH || "data.db");
@@ -10,7 +10,7 @@ initDb(process.env.DB_PATH || "data.db");
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
 };
 
 function withCors(response: Response): Response {
@@ -50,9 +50,17 @@ const server = Bun.serve({
       } else if (path === "/api/stats/keys" && req.method === "GET") {
         response = handleListPublicKeys(req);
       } else if (path === "/api/backup" && req.method === "POST") {
-        response = await handleBackup();
+        if (!verifyAdminKey(req)) {
+          response = Response.json({ error: "unauthorized" }, { status: 401 });
+        } else {
+          response = await handleBackup();
+        }
       } else if (path === "/api/restore" && req.method === "POST") {
-        response = await handleRestore(req);
+        if (!verifyAdminKey(req)) {
+          response = Response.json({ error: "unauthorized" }, { status: 401 });
+        } else {
+          response = await handleRestore(req);
+        }
       } else {
         response = Response.json({ error: "not found" }, { status: 404 });
       }
