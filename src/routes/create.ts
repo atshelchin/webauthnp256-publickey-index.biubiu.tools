@@ -14,6 +14,7 @@ export async function handleCreate(req: Request): Promise<Response> {
     publicKey?: string;
     challenge?: string;
     signature?: string;
+    name?: string;
   };
 
   try {
@@ -44,7 +45,8 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "public key already exists" }, { status: 409 });
   }
 
-  const result = createPublicKey(rpId, credentialId, publicKey);
+  const name = body.name || "";
+  const result = createPublicKey(rpId, credentialId, publicKey, name);
   cacheInvalidateByRpId(rpId);
 
   return Response.json(result, { status: 201 });
