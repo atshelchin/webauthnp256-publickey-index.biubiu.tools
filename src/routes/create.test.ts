@@ -1,5 +1,6 @@
 import { test, expect, beforeEach } from "bun:test";
 import { p256 } from "@noble/curves/nist.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { initDb, getPublicKey } from "../db.ts";
 import { cacheClear, cacheSet, cacheGet } from "../cache.ts";
 import { generateChallenge } from "../challenge.ts";
@@ -7,6 +8,10 @@ import { handleChallenge, handleCreate } from "./create.ts";
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("base64url");
 }
 
 beforeEach(() => {
@@ -30,16 +35,33 @@ function makeSignedBody(overrides: Record<string, unknown> = {}) {
   const { secretKey, publicKey } = p256.keygen();
   const publicKeyHex = bytesToHex(publicKey);
   const challenge = generateChallenge();
-  const message = new TextEncoder().encode(challenge);
-  const signature = p256.sign(message, secretKey);
-  const signatureHex = bytesToHex(signature);
+
+  // Simulate WebAuthn assertion
+  const clientData = JSON.stringify({
+    type: "webauthn.get",
+    challenge,
+    origin: "https://example.com",
+    crossOrigin: false,
+  });
+  const clientDataJSON = new TextEncoder().encode(clientData);
+  const authenticatorData = new Uint8Array(37);
+  crypto.getRandomValues(authenticatorData);
+
+  const clientDataHash = sha256(clientDataJSON);
+  const signedData = new Uint8Array(authenticatorData.length + clientDataHash.length);
+  signedData.set(authenticatorData, 0);
+  signedData.set(clientDataHash, authenticatorData.length);
+
+  const signature = p256.sign(signedData, secretKey);
 
   return {
     rpId: "site.com",
     credentialId: "cred1",
     publicKey: publicKeyHex,
     challenge,
-    signature: signatureHex,
+    signature: bytesToHex(signature),
+    authenticatorData: toBase64url(authenticatorData),
+    clientDataJSON: toBase64url(clientDataJSON),
     ...overrides,
   };
 }
@@ -66,6 +88,13 @@ test("handleCreate returns 400 for missing fields", async () => {
   expect(res.status).toBe(400);
 });
 
+test("handleCreate returns 400 for missing authenticatorData", async () => {
+  const body = makeSignedBody();
+  delete (body as Record<string, unknown>).authenticatorData;
+  const res = await handleCreate(makeRequest(body));
+  expect(res.status).toBe(400);
+});
+
 test("handleCreate returns 400 for invalid challenge", async () => {
   const body = makeSignedBody({ challenge: "bogus" });
   const res = await handleCreate(makeRequest(body));
@@ -75,17 +104,10 @@ test("handleCreate returns 400 for invalid challenge", async () => {
 });
 
 test("handleCreate returns 400 for bad signature", async () => {
+  const body = makeSignedBody({ signature: "deadbeef" });
+  // Need a valid challenge for this test
   const challenge = generateChallenge();
-  const { publicKey } = p256.keygen();
-  const publicKeyHex = bytesToHex(publicKey);
-
-  const body = {
-    rpId: "site.com",
-    credentialId: "c1",
-    publicKey: publicKeyHex,
-    challenge,
-    signature: "deadbeef",
-  };
+  body.challenge = challenge;
   const res = await handleCreate(makeRequest(body));
   expect(res.status).toBe(400);
   const json = await res.json();

@@ -1,4 +1,5 @@
 import { p256 } from "@noble/curves/nist.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 
 const CHALLENGE_TTL = 5 * 60 * 1000; // 5 minutes
 const challenges = new Map<string, number>(); // challenge -> expiresAt
@@ -17,19 +18,46 @@ export function consumeChallenge(challenge: string): boolean {
   return Date.now() <= expiresAt;
 }
 
-// p256 v2 hashes message internally with sha256
-export function verifySignature(publicKeyHex: string, challenge: string, signatureHex: string): boolean {
+/**
+ * Verify a WebAuthn assertion signature.
+ *
+ * WebAuthn signs: authenticatorData || SHA-256(clientDataJSON)
+ * ECDSA P256 then hashes that with SHA-256 internally.
+ *
+ * clientDataJSON contains the challenge, so we verify it matches.
+ */
+export function verifyWebAuthnSignature(
+  publicKeyHex: string,
+  challenge: string,
+  signatureHex: string,
+  authenticatorDataBase64url: string,
+  clientDataJSONBase64url: string,
+): boolean {
   try {
-    const message = new TextEncoder().encode(challenge);
+    // 1. Decode and verify clientDataJSON contains the expected challenge
+    const clientDataJSON = Buffer.from(clientDataJSONBase64url, "base64url");
+    const clientData = JSON.parse(clientDataJSON.toString("utf-8"));
+    if (clientData.challenge !== challenge) return false;
+    if (clientData.type !== "webauthn.get") return false;
+
+    // 2. Build the signed message: authenticatorData || SHA-256(clientDataJSON)
+    const authenticatorData = Buffer.from(authenticatorDataBase64url, "base64url");
+    const clientDataHash = sha256(new Uint8Array(clientDataJSON));
+    const signedData = new Uint8Array(authenticatorData.length + clientDataHash.length);
+    signedData.set(new Uint8Array(authenticatorData), 0);
+    signedData.set(clientDataHash, authenticatorData.length);
+
+    // 3. Verify signature
     const sigBytes = hexToBytes(signatureHex);
     const pubBytes = hexToBytes(publicKeyHex);
-    return p256.verify(sigBytes, message, pubBytes);
+    return p256.verify(sigBytes, signedData, pubBytes);
   } catch {
     return false;
   }
 }
 
-function hexToBytes(hex: string): Uint8Array {
+export function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) hex = "0" + hex;
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);

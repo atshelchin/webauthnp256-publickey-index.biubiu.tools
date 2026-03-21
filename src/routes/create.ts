@@ -1,6 +1,6 @@
 import { createPublicKey, getPublicKey } from "../db.ts";
 import { cacheInvalidateByRpId } from "../cache.ts";
-import { generateChallenge, consumeChallenge, verifySignature } from "../challenge.ts";
+import { generateChallenge, consumeChallenge, verifyWebAuthnSignature } from "../challenge.ts";
 
 export function handleChallenge(): Response {
   const challenge = generateChallenge();
@@ -14,6 +14,8 @@ export async function handleCreate(req: Request): Promise<Response> {
     publicKey?: string;
     challenge?: string;
     signature?: string;
+    authenticatorData?: string;
+    clientDataJSON?: string;
     name?: string;
   };
 
@@ -23,11 +25,11 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { rpId, credentialId, publicKey, challenge, signature } = body;
+  const { rpId, credentialId, publicKey, challenge, signature, authenticatorData, clientDataJSON } = body;
 
-  if (!rpId || !credentialId || !publicKey || !challenge || !signature) {
+  if (!rpId || !credentialId || !publicKey || !challenge || !signature || !authenticatorData || !clientDataJSON) {
     return Response.json(
-      { error: "rpId, credentialId, publicKey, challenge, and signature are required" },
+      { error: "rpId, credentialId, publicKey, challenge, signature, authenticatorData, and clientDataJSON are required" },
       { status: 400 }
     );
   }
@@ -36,7 +38,7 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid or expired challenge" }, { status: 400 });
   }
 
-  if (!verifySignature(publicKey, challenge, signature)) {
+  if (!verifyWebAuthnSignature(publicKey, challenge, signature, authenticatorData, clientDataJSON)) {
     return Response.json({ error: "signature verification failed" }, { status: 400 });
   }
 
