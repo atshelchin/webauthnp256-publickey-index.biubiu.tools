@@ -37,7 +37,10 @@ export function verifyWebAuthnSignature(
     // 1. Decode and verify clientDataJSON contains the expected challenge
     const clientDataJSON = Buffer.from(clientDataJSONBase64url, "base64url");
     const clientData = JSON.parse(clientDataJSON.toString("utf-8"));
-    if (clientData.challenge !== challenge) return false;
+    // Browser base64url-encodes the challenge bytes in clientDataJSON
+    // Client passes TextEncoder.encode(challenge) as challenge bytes
+    const expectedChallengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
+    if (clientData.challenge !== expectedChallengeB64) return false;
     if (clientData.type !== "webauthn.get") return false;
 
     // 2. Build the signed message: authenticatorData || SHA-256(clientDataJSON)

@@ -18,9 +18,11 @@ function toBase64url(bytes: Uint8Array): string {
  * - Sign authenticatorData || SHA-256(clientDataJSON)
  */
 function makeWebAuthnAssertion(secretKey: Uint8Array, challenge: string) {
+  // Browser base64url-encodes the challenge bytes in clientDataJSON
+  const challengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
   const clientData = JSON.stringify({
     type: "webauthn.get",
-    challenge,
+    challenge: challengeB64,
     origin: "https://example.com",
     crossOrigin: false,
   });
@@ -133,7 +135,8 @@ test("verifyWebAuthnSignature rejects wrong clientDataJSON type", () => {
   const challenge = "test-challenge";
 
   // Build clientDataJSON with wrong type
-  const clientData = JSON.stringify({ type: "webauthn.create", challenge, origin: "https://example.com" });
+  const challengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
+  const clientData = JSON.stringify({ type: "webauthn.create", challenge: challengeB64, origin: "https://example.com" });
   const clientDataJSON = new TextEncoder().encode(clientData);
   const authenticatorData = new Uint8Array(37);
   const clientDataHash = sha256(clientDataJSON);

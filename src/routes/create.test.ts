@@ -36,10 +36,11 @@ function makeSignedBody(overrides: Record<string, unknown> = {}) {
   const publicKeyHex = bytesToHex(publicKey);
   const challenge = generateChallenge();
 
-  // Simulate WebAuthn assertion
+  // Simulate WebAuthn assertion (browser base64url-encodes challenge bytes)
+  const challengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
   const clientData = JSON.stringify({
     type: "webauthn.get",
-    challenge,
+    challenge: challengeB64,
     origin: "https://example.com",
     crossOrigin: false,
   });
