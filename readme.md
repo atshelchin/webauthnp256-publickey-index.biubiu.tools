@@ -2,6 +2,8 @@
 
 WebAuthn P256 公钥索引服务。存储 passkeys 创建时的公钥与站点信息，作为多个应用的唯一公钥存储。
 
+公共端点: `https://webauthnp256-publickey-index.biubiu.tools` 可直接使用，但数据安全和可用性由我们维护，建议自行部署以完全掌控数据。
+
 - 运行时: Bun (编译为二进制部署)
 - 数据库: SQLite (WAL 模式)
 - 默认端口: 11256

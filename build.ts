@@ -22,6 +22,9 @@ const html = `<!DOCTYPE html>
     border-radius: 6px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
+  .markdown-body {
+        margin: 40px auto !important;
+  }
   .markdown-body { font-size: 16px; line-height: 1.7; }
   @media (max-width: 767px) {
     body { margin: 16px; padding: 24px 16px; }

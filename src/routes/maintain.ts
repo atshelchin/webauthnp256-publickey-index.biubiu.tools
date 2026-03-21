@@ -62,6 +62,21 @@ async function sendTelegramMessage(message: string): Promise<void> {
 }
 
 let lastBackupKey: string | null = null;
+const BACKUP_INTERVAL = 60 * 60 * 1000; // 1 hour
+
+export function startAutoBackup() {
+  setInterval(async () => {
+    console.log("[auto-backup] Starting scheduled backup...");
+    const res = await handleBackup();
+    const body = await res.json();
+    if (body.success) {
+      console.log(`[auto-backup] Success: ${body.url}`);
+    } else {
+      console.error(`[auto-backup] Failed: ${body.error}`);
+    }
+  }, BACKUP_INTERVAL);
+  console.log("[auto-backup] Scheduled every 1 hour");
+}
 
 export async function handleBackup(): Promise<Response> {
   try {
