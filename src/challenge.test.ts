@@ -87,7 +87,7 @@ test("verifyWebAuthnSignature validates a correct WebAuthn assertion", () => {
 
   expect(
     verifyWebAuthnSignature(publicKeyHex, challenge, signatureHex, authenticatorDataBase64url, clientDataJSONBase64url)
-  ).toBe(true);
+  ).toEqual({ ok: true });
 });
 
 test("verifyWebAuthnSignature rejects wrong challenge", () => {
@@ -97,9 +97,9 @@ test("verifyWebAuthnSignature rejects wrong challenge", () => {
   const { signatureHex, authenticatorDataBase64url, clientDataJSONBase64url } =
     makeWebAuthnAssertion(secretKey, "real-challenge");
 
-  expect(
-    verifyWebAuthnSignature(publicKeyHex, "wrong-challenge", signatureHex, authenticatorDataBase64url, clientDataJSONBase64url)
-  ).toBe(false);
+  const result = verifyWebAuthnSignature(publicKeyHex, "wrong-challenge", signatureHex, authenticatorDataBase64url, clientDataJSONBase64url);
+  expect(result.ok).toBe(false);
+  expect(result.error).toContain("challenge mismatch");
 });
 
 test("verifyWebAuthnSignature rejects wrong public key", () => {
@@ -111,9 +111,9 @@ test("verifyWebAuthnSignature rejects wrong public key", () => {
   const { signatureHex, authenticatorDataBase64url, clientDataJSONBase64url } =
     makeWebAuthnAssertion(secretKey, challenge);
 
-  expect(
-    verifyWebAuthnSignature(wrongPublicKeyHex, challenge, signatureHex, authenticatorDataBase64url, clientDataJSONBase64url)
-  ).toBe(false);
+  const result = verifyWebAuthnSignature(wrongPublicKeyHex, challenge, signatureHex, authenticatorDataBase64url, clientDataJSONBase64url);
+  expect(result.ok).toBe(false);
+  expect(result.error).toContain("p256.verify failed");
 });
 
 test("verifyWebAuthnSignature rejects tampered signature", () => {
@@ -124,9 +124,8 @@ test("verifyWebAuthnSignature rejects tampered signature", () => {
   const { authenticatorDataBase64url, clientDataJSONBase64url } =
     makeWebAuthnAssertion(secretKey, challenge);
 
-  expect(
-    verifyWebAuthnSignature(publicKeyHex, challenge, "deadbeef", authenticatorDataBase64url, clientDataJSONBase64url)
-  ).toBe(false);
+  const result = verifyWebAuthnSignature(publicKeyHex, challenge, "deadbeef", authenticatorDataBase64url, clientDataJSONBase64url);
+  expect(result.ok).toBe(false);
 });
 
 test("verifyWebAuthnSignature rejects wrong clientDataJSON type", () => {
@@ -134,7 +133,6 @@ test("verifyWebAuthnSignature rejects wrong clientDataJSON type", () => {
   const publicKeyHex = bytesToHex(publicKey);
   const challenge = "test-challenge";
 
-  // Build clientDataJSON with wrong type
   const challengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
   const clientData = JSON.stringify({ type: "webauthn.create", challenge: challengeB64, origin: "https://example.com" });
   const clientDataJSON = new TextEncoder().encode(clientData);
@@ -145,18 +143,18 @@ test("verifyWebAuthnSignature rejects wrong clientDataJSON type", () => {
   signedData.set(clientDataHash, 37);
   const signature = p256.sign(signedData, secretKey);
 
-  expect(
-    verifyWebAuthnSignature(
-      publicKeyHex, challenge, bytesToHex(signature),
-      toBase64url(authenticatorData), toBase64url(clientDataJSON)
-    )
-  ).toBe(false);
+  const result = verifyWebAuthnSignature(
+    publicKeyHex, challenge, bytesToHex(signature),
+    toBase64url(authenticatorData), toBase64url(clientDataJSON)
+  );
+  expect(result.ok).toBe(false);
+  expect(result.error).toContain("wrong type");
 });
 
-test("verifyWebAuthnSignature returns false for empty strings", () => {
-  expect(verifyWebAuthnSignature("", "", "", "", "")).toBe(false);
+test("verifyWebAuthnSignature returns error for empty strings", () => {
+  expect(verifyWebAuthnSignature("", "", "", "", "").ok).toBe(false);
 });
 
-test("verifyWebAuthnSignature returns false for malformed inputs", () => {
-  expect(verifyWebAuthnSignature("zzzz", "challenge", "deadbeef", "xxx", "yyy")).toBe(false);
+test("verifyWebAuthnSignature returns error for malformed inputs", () => {
+  expect(verifyWebAuthnSignature("zzzz", "challenge", "deadbeef", "xxx", "yyy").ok).toBe(false);
 });

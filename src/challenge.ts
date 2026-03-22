@@ -32,7 +32,7 @@ export function verifyWebAuthnSignature(
   signatureHex: string,
   authenticatorDataBase64url: string,
   clientDataJSONBase64url: string,
-): boolean {
+): { ok: boolean; error?: string } {
   try {
     // 1. Decode and verify clientDataJSON contains the expected challenge
     const clientDataJSON = Buffer.from(clientDataJSONBase64url, "base64url");
@@ -40,8 +40,12 @@ export function verifyWebAuthnSignature(
     // Browser base64url-encodes the challenge bytes in clientDataJSON
     // Client passes TextEncoder.encode(challenge) as challenge bytes
     const expectedChallengeB64 = Buffer.from(new TextEncoder().encode(challenge)).toString("base64url");
-    if (clientData.challenge !== expectedChallengeB64) return false;
-    if (clientData.type !== "webauthn.get") return false;
+    if (clientData.challenge !== expectedChallengeB64) {
+      return { ok: false, error: `challenge mismatch: expected=${expectedChallengeB64}, got=${clientData.challenge}` };
+    }
+    if (clientData.type !== "webauthn.get") {
+      return { ok: false, error: `wrong type: expected=webauthn.get, got=${clientData.type}` };
+    }
 
     // 2. Build the signed message: authenticatorData || SHA-256(clientDataJSON)
     const authenticatorData = Buffer.from(authenticatorDataBase64url, "base64url");
@@ -54,9 +58,13 @@ export function verifyWebAuthnSignature(
     const sigBytes = hexToBytes(signatureHex);
     const pubBytes = hexToBytes(publicKeyHex);
     // WebAuthn authenticators may produce high-S signatures, so disable lowS check
-    return p256.verify(sigBytes, signedData, pubBytes, { lowS: false });
-  } catch {
-    return false;
+    const valid = p256.verify(sigBytes, signedData, pubBytes, { lowS: false });
+    if (!valid) {
+      return { ok: false, error: `p256.verify failed: sig=${signatureHex.length}chars, authData=${authenticatorData.length}bytes, pubKey=${pubBytes.length}bytes` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `exception: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
