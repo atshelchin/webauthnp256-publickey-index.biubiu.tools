@@ -38,8 +38,9 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid or expired challenge" }, { status: 400 });
   }
 
-  if (!verifyWebAuthnSignature(publicKey, challenge, signature, authenticatorData, clientDataJSON)) {
-    return Response.json({ error: "signature verification failed" }, { status: 400 });
+  const verification = verifyWebAuthnSignature(publicKey, challenge, signature, authenticatorData, clientDataJSON);
+  if (!verification.ok) {
+    return Response.json({ error: `signature verification failed: ${verification.error}` }, { status: 400 });
   }
 
   const existing = getPublicKey(rpId, credentialId);
