@@ -1,9 +1,11 @@
 import { assertEquals } from "@std/assert/";
 import { cacheClear } from "../cache.ts";
+import { initQueue } from "../queue.ts";
 import { handleQuery } from "./query.ts";
 
 function setup() {
   cacheClear();
+  initQueue(":memory:");
 }
 
 Deno.test("handleQuery returns 400 when rpId missing", async () => {

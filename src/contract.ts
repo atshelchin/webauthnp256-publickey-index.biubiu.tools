@@ -1,29 +1,7 @@
-import { createPublicClient, createWalletClient, http, keccak256, encodeAbiParameters, type Abi } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { createPublicClient, http, type Abi } from "viem";
 import { gnosis } from "viem/chains";
 
 const abi = [
-  {
-    type: "function",
-    name: "commit",
-    inputs: [{ name: "commitment", type: "bytes32" }],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "createRecord",
-    inputs: [
-      { name: "rpId", type: "string" },
-      { name: "credentialId", type: "string" },
-      { name: "publicKey", type: "bytes" },
-      { name: "name", type: "string" },
-      { name: "initialCredentialId", type: "string" },
-      { name: "metadata", type: "bytes" },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
   {
     type: "function",
     name: "getRecord",
@@ -116,17 +94,6 @@ function getClient() {
   });
 }
 
-function getWalletClient() {
-  const pk = Deno.env.get("PRIVATE_KEY");
-  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
-  const account = privateKeyToAccount(pk as `0x${string}`);
-  return createWalletClient({
-    account,
-    chain: gnosis,
-    transport: http(getRpcUrl()),
-  });
-}
-
 // Strip leading "0x" from viem hex bytes
 function stripHexPrefix(hex: string): string {
   return hex.startsWith("0x") ? hex.slice(2) : hex;
@@ -162,70 +129,6 @@ export async function getPublicKey(rpId: string, credentialId: string) {
     metadata: stripHexPrefix(record.metadata),
     createdAt: Number(record.createdAt) * 1000,
   };
-}
-
-// --- Create (commit-reveal) ---
-
-export async function createPublicKey(
-  rpId: string,
-  credentialId: string,
-  publicKey: string,
-  name: string,
-  initialCredentialId: string,
-  metadata: string,
-): Promise<{ txHash: string }> {
-  const client = getClient();
-  const wallet = getWalletClient();
-
-  const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
-  const metadataHex = (metadata ? (metadata.startsWith("0x") ? metadata : `0x${metadata}`) : "0x") as `0x${string}`;
-
-  // 1. Compute commitment
-  const commitment = keccak256(
-    encodeAbiParameters(
-      [
-        { type: "string" },
-        { type: "string" },
-        { type: "bytes" },
-        { type: "string" },
-        { type: "string" },
-        { type: "bytes" },
-      ],
-      [rpId, credentialId, publicKeyHex, name, initialCredentialId, metadataHex],
-    ),
-  );
-
-  // 2. Send commit tx
-  const commitHash = await wallet.writeContract({
-    address: CONTRACT_ADDRESS,
-    abi,
-    functionName: "commit",
-    args: [commitment],
-  });
-  await client.waitForTransactionReceipt({ hash: commitHash });
-
-  // 3. Wait for 1 block (REVEAL_DELAY)
-  await waitForNextBlock(client);
-
-  // 4. Send createRecord tx
-  const createHash = await wallet.writeContract({
-    address: CONTRACT_ADDRESS,
-    abi,
-    functionName: "createRecord",
-    args: [rpId, credentialId, publicKeyHex, name, initialCredentialId, metadataHex],
-  });
-  await client.waitForTransactionReceipt({ hash: createHash });
-
-  return { txHash: createHash };
-}
-
-async function waitForNextBlock(client: ReturnType<typeof getClient>): Promise<void> {
-  const current = await client.getBlockNumber();
-  while (true) {
-    await new Promise((r) => setTimeout(r, 2000));
-    const now = await client.getBlockNumber();
-    if (now > current) return;
-  }
 }
 
 // --- Stats ---

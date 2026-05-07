@@ -1,5 +1,6 @@
 import { getPublicKey } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
+import { findDuplicate } from "../queue.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
@@ -18,11 +19,27 @@ export async function handleQuery(req: Request): Promise<Response> {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
+  // Try on-chain first
   const result = await getPublicKey(rpId, credentialId);
-  if (!result) {
-    return Response.json({ error: "not found" }, { status: 404 });
+  if (result) {
+    cacheSet(cacheKey, result);
+    return Response.json(result, { headers: CACHE_HEADERS });
   }
 
-  cacheSet(cacheKey, result);
-  return Response.json(result, { headers: CACHE_HEADERS });
+  // Fallback: check queue for pending/in-progress records
+  const queued = findDuplicate(rpId, credentialId);
+  if (queued) {
+    return Response.json({
+      rpId: queued.rpId,
+      credentialId: queued.credentialId,
+      publicKey: queued.publicKey,
+      name: queued.name,
+      initialCredentialId: queued.initialCredentialId,
+      metadata: queued.metadata,
+      createdAt: queued.createdAt,
+      _queue: { id: queued.id, status: queued.status },
+    });
+  }
+
+  return Response.json({ error: "not found" }, { status: 404 });
 }

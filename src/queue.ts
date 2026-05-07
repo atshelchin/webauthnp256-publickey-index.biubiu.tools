@@ -1,0 +1,302 @@
+import { DatabaseSync as Database } from "node:sqlite";
+
+// --- Types ---
+
+export type QueueStatus = "pending" | "committing" | "committed" | "creating" | "done" | "failed";
+
+export interface QueueItem {
+  id: string;
+  status: QueueStatus;
+  rpId: string;
+  credentialId: string;
+  publicKey: string;
+  name: string;
+  initialCredentialId: string;
+  metadata: string;
+  txHash: string;
+  error: string;
+  retries: number;
+  ip: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// --- Config ---
+
+const MAX_RETRIES = 3;
+const WORKER_INTERVAL = 2000; // 2s
+const BATCH_SIZE = 50;
+
+// --- Rate Limiting ---
+
+const RATE_WINDOW = 60_000; // 1 minute
+const RATE_LIMIT = 5; // max requests per IP per window
+const ipRequests = new Map<string, number[]>(); // ip -> timestamps
+
+export function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const timestamps = ipRequests.get(ip) ?? [];
+  const recent = timestamps.filter((t) => now - t < RATE_WINDOW);
+  if (recent.length >= RATE_LIMIT) return false;
+  recent.push(now);
+  ipRequests.set(ip, recent);
+  return true;
+}
+
+// Cleanup stale IP entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, timestamps] of ipRequests) {
+    const recent = timestamps.filter((t) => now - t < RATE_WINDOW);
+    if (recent.length === 0) ipRequests.delete(ip);
+    else ipRequests.set(ip, recent);
+  }
+}, 5 * 60_000);
+
+// --- SQLite Queue ---
+
+let db: Database;
+
+export function initQueue(dbPath = "queue.db") {
+  db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS create_queue (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'pending',
+      rpId TEXT NOT NULL,
+      credentialId TEXT NOT NULL,
+      publicKey TEXT NOT NULL,
+      name TEXT NOT NULL,
+      initialCredentialId TEXT NOT NULL,
+      metadata TEXT NOT NULL,
+      txHash TEXT NOT NULL DEFAULT '',
+      error TEXT NOT NULL DEFAULT '',
+      retries INTEGER NOT NULL DEFAULT 0,
+      ip TEXT NOT NULL DEFAULT '',
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
+}
+
+export function getQueueDb(): Database {
+  return db;
+}
+
+function generateId(): string {
+  return crypto.randomUUID();
+}
+
+export function enqueue(params: {
+  rpId: string;
+  credentialId: string;
+  publicKey: string;
+  name: string;
+  initialCredentialId: string;
+  metadata: string;
+  ip: string;
+}): string {
+  const id = generateId();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO create_queue (id, status, rpId, credentialId, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
+    VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, params.rpId, params.credentialId, params.publicKey, params.name, params.initialCredentialId, params.metadata, params.ip, now, now);
+  return id;
+}
+
+export function getQueueItem(id: string): QueueItem | null {
+  return (db.prepare("SELECT * FROM create_queue WHERE id = ?").get(id) as unknown as QueueItem | undefined) ?? null;
+}
+
+export function findDuplicate(rpId: string, credentialId: string): QueueItem | null {
+  return (db.prepare(
+    "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? AND status NOT IN ('failed') ORDER BY createdAt DESC LIMIT 1"
+  ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
+}
+
+// --- Worker ---
+
+let workerRunning = false;
+
+export function startQueueWorker() {
+  console.log("[queue] Worker started, interval: 2s");
+  setInterval(() => {
+    if (workerRunning) return;
+    processQueue().catch((err) => console.error("[queue] Worker error:", err));
+  }, WORKER_INTERVAL);
+}
+
+async function processQueue() {
+  workerRunning = true;
+  try {
+    await processPending();
+    await processCommitted();
+  } finally {
+    workerRunning = false;
+  }
+}
+
+async function processPending() {
+  const items = db.prepare(
+    "SELECT * FROM create_queue WHERE status = 'pending' ORDER BY createdAt ASC LIMIT ?"
+  ).all(BATCH_SIZE) as unknown as QueueItem[];
+
+  if (items.length === 0) return;
+  console.log(`[queue] Processing ${items.length} pending items...`);
+
+  // Mark as committing
+  const ids = items.map((i) => i.id);
+  for (const id of ids) {
+    db.prepare("UPDATE create_queue SET status = 'committing', updatedAt = ? WHERE id = ?").run(Date.now(), id);
+  }
+
+  // Batch commit - fire all in parallel
+  const results = await Promise.allSettled(
+    items.map((item) => commitItem(item))
+  );
+
+  for (let i = 0; i < items.length; i++) {
+    const result = results[i];
+    if (result.status === "fulfilled") {
+      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
+    } else {
+      handleFailure(items[i], result.reason?.message ?? "commit failed");
+    }
+  }
+}
+
+async function processCommitted() {
+  const items = db.prepare(
+    "SELECT * FROM create_queue WHERE status = 'committed' ORDER BY createdAt ASC LIMIT ?"
+  ).all(BATCH_SIZE) as unknown as QueueItem[];
+
+  if (items.length === 0) return;
+  console.log(`[queue] Creating ${items.length} committed items on-chain...`);
+
+  // Mark as creating
+  for (const item of items) {
+    db.prepare("UPDATE create_queue SET status = 'creating', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+  }
+
+  // Batch createRecord - fire all in parallel
+  const results = await Promise.allSettled(
+    items.map((item) => createItem(item))
+  );
+
+  for (let i = 0; i < items.length; i++) {
+    const result = results[i];
+    if (result.status === "fulfilled") {
+      db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
+        .run(result.value, Date.now(), items[i].id);
+    } else {
+      handleFailure(items[i], result.reason?.message ?? "create failed");
+    }
+  }
+}
+
+function handleFailure(item: QueueItem, error: string) {
+  const retries = item.retries + 1;
+  if (retries >= MAX_RETRIES) {
+    db.prepare("UPDATE create_queue SET status = 'failed', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
+      .run(error, retries, Date.now(), item.id);
+    console.error(`[queue] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
+  } else {
+    // Reset to pending for retry
+    db.prepare("UPDATE create_queue SET status = 'pending', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
+      .run(error, retries, Date.now(), item.id);
+    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}): ${error}`);
+  }
+}
+
+// --- On-chain operations (extracted from contract.ts for granular control) ---
+
+import { createPublicClient, createWalletClient, http, keccak256, encodeAbiParameters, type Abi } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { gnosis } from "viem/chains";
+
+const CONTRACT_ADDRESS = "0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b" as const;
+
+const writeAbi = [
+  {
+    type: "function",
+    name: "commit",
+    inputs: [{ name: "commitment", type: "bytes32" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "createRecord",
+    inputs: [
+      { name: "rpId", type: "string" },
+      { name: "credentialId", type: "string" },
+      { name: "publicKey", type: "bytes" },
+      { name: "name", type: "string" },
+      { name: "initialCredentialId", type: "string" },
+      { name: "metadata", type: "bytes" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+] as const satisfies Abi;
+
+function getRpcUrl(): string {
+  return Deno.env.get("RPC_URL") || "https://rpc.gnosischain.com";
+}
+
+function getClient() {
+  return createPublicClient({ chain: gnosis, transport: http(getRpcUrl()) });
+}
+
+function getWallet() {
+  const pk = Deno.env.get("PRIVATE_KEY");
+  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
+  return createWalletClient({
+    account: privateKeyToAccount(pk as `0x${string}`),
+    chain: gnosis,
+    transport: http(getRpcUrl()),
+  });
+}
+
+async function commitItem(item: QueueItem): Promise<void> {
+  const client = getClient();
+  const wallet = getWallet();
+
+  const publicKeyHex = (item.publicKey.startsWith("0x") ? item.publicKey : `0x${item.publicKey}`) as `0x${string}`;
+  const metadataHex = (item.metadata.startsWith("0x") ? item.metadata : `0x${item.metadata}`) as `0x${string}`;
+
+  const commitment = keccak256(
+    encodeAbiParameters(
+      [{ type: "string" }, { type: "string" }, { type: "bytes" }, { type: "string" }, { type: "string" }, { type: "bytes" }],
+      [item.rpId, item.credentialId, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+    ),
+  );
+
+  const hash = await wallet.writeContract({
+    address: CONTRACT_ADDRESS,
+    abi: writeAbi,
+    functionName: "commit",
+    args: [commitment],
+  });
+  await client.waitForTransactionReceipt({ hash });
+}
+
+async function createItem(item: QueueItem): Promise<string> {
+  const client = getClient();
+  const wallet = getWallet();
+
+  const publicKeyHex = (item.publicKey.startsWith("0x") ? item.publicKey : `0x${item.publicKey}`) as `0x${string}`;
+  const metadataHex = (item.metadata.startsWith("0x") ? item.metadata : `0x${item.metadata}`) as `0x${string}`;
+
+  const hash = await wallet.writeContract({
+    address: CONTRACT_ADDRESS,
+    abi: writeAbi,
+    functionName: "createRecord",
+    args: [item.rpId, item.credentialId, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+  });
+  await client.waitForTransactionReceipt({ hash });
+  return hash;
+}
