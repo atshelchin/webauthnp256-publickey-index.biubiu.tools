@@ -1,9 +1,9 @@
-import { getPublicKey } from "../db.ts";
+import { getPublicKey } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
-export function handleQuery(req: Request): Response {
+export async function handleQuery(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const rpId = url.searchParams.get("rpId");
   const credentialId = url.searchParams.get("credentialId");
@@ -18,7 +18,7 @@ export function handleQuery(req: Request): Response {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = getPublicKey(rpId, credentialId);
+  const result = await getPublicKey(rpId, credentialId);
   if (!result) {
     return Response.json({ error: "not found" }, { status: 404 });
   }

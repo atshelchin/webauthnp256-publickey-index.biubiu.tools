@@ -1,7 +1,7 @@
 import { marked } from "marked";
 
 // 1. Convert readme.md to index.html
-const markdown = await Bun.file("readme.md").text();
+const markdown = await Deno.readTextFile("readme.md");
 const htmlBody = await marked(markdown);
 const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -33,14 +33,23 @@ const html = `<!DOCTYPE html>
 </head>
 <body class="markdown-body">${htmlBody}</body>
 </html>`;
-await Bun.write("src/index.html", html);
+await Deno.writeTextFile("src/index.html", html);
 console.log("Generated src/index.html");
 
 // 2. Compile to binary
-const result = Bun.spawnSync(["bun", "build", "index.ts", "--compile", "--outfile", "dist/webauthnp256-publickey-index"]);
-if (result.exitCode !== 0) {
-  console.error(result.stderr.toString());
-  process.exit(1);
+const cmd = new Deno.Command("deno", {
+  args: [
+    "compile",
+    "--include", "src/index.html",
+    "--allow-net", "--allow-read", "--allow-write", "--allow-env", "--allow-ffi",
+    "--output", "dist/webauthnp256-publickey-index",
+    "index.ts",
+  ],
+  stdout: "inherit",
+  stderr: "inherit",
+});
+const { code } = await cmd.output();
+if (code !== 0) {
+  Deno.exit(1);
 }
-console.log(result.stdout.toString());
 console.log("Build complete");
