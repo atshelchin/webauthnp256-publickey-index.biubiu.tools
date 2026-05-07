@@ -1,4 +1,5 @@
 import { createPublicKey, getPublicKey } from "../contract.ts";
+import { encodeAbiParameters } from "viem";
 
 export async function handleCreate(req: Request): Promise<Response> {
   let body: {
@@ -16,14 +17,22 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { rpId, credentialId, publicKey, name, initialCredentialId, metadata } = body;
+  const { rpId, credentialId, publicKey } = body;
 
-  if (!rpId || !credentialId || !publicKey || !name || !initialCredentialId || !metadata) {
+  const name = body.name;
+
+  if (!rpId || !credentialId || !publicKey || !name) {
     return Response.json(
-      { error: "rpId, credentialId, publicKey, name, initialCredentialId, and metadata are required" },
+      { error: "rpId, credentialId, publicKey, and name are required" },
       { status: 400 },
     );
   }
+  const initialCredentialId = body.initialCredentialId || credentialId;
+  const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
+  const metadata = body.metadata || encodeAbiParameters(
+    [{ type: "string" }, { type: "bytes" }],
+    ["VelaWalletV1", publicKeyHex],
+  );
 
   // Check if already exists
   const existing = await getPublicKey(rpId, credentialId);

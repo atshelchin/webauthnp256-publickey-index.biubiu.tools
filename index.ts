@@ -1,4 +1,5 @@
 import { handleQuery } from "./src/routes/query.ts";
+import { handleChallenge } from "./src/routes/challenge.ts";
 import { handleCreate } from "./src/routes/create.ts";
 import { handleListRpIds, handleListPublicKeys } from "./src/routes/stats.ts";
 
@@ -36,6 +37,8 @@ const server = Deno.serve({ port }, async (req) => {
       });
     } else if (path === "/api/health" && req.method === "GET") {
       response = Response.json({ status: "ok" });
+    } else if (path === "/api/challenge" && req.method === "GET") {
+      response = handleChallenge();
     } else if (path === "/api/query" && req.method === "GET") {
       response = await handleQuery(req);
     } else if (path === "/api/create" && req.method === "POST") {
