@@ -16,18 +16,14 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { rpId, credentialId, publicKey } = body;
+  const { rpId, credentialId, publicKey, name, initialCredentialId, metadata } = body;
 
-  if (!rpId || !credentialId || !publicKey) {
+  if (!rpId || !credentialId || !publicKey || !name || !initialCredentialId || !metadata) {
     return Response.json(
-      { error: "rpId, credentialId, and publicKey are required" },
+      { error: "rpId, credentialId, publicKey, name, initialCredentialId, and metadata are required" },
       { status: 400 },
     );
   }
-
-  const name = body.name || "";
-  const initialCredentialId = body.initialCredentialId || credentialId;
-  const metadata = body.metadata || "";
 
   // Check if already exists
   const existing = await getPublicKey(rpId, credentialId);

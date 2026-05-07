@@ -18,6 +18,7 @@ import {
 import { createSshSession } from "./deploy/ssh.ts";
 import {
   CURRENT_LINK,
+  ENV_FILE,
   ensureDirectories,
   ensureEnvFile,
   ensureServiceUser,
@@ -144,6 +145,34 @@ async function runDeploy(cfg: DeployConfig) {
     await ensureDirectories(ssh);
     console.log("-> Ensuring env file...");
     await ensureEnvFile(ssh);
+
+    // Prompt for env vars on first deploy or if PRIVATE_KEY is missing
+    const envCheck = await ssh.runCapture(["bash", "-lc", `grep -q '^PRIVATE_KEY=' ${ENV_FILE} 2>/dev/null && echo found || echo missing`]);
+    if (state.firstTime || envCheck.stdout.trim() === "missing") {
+      console.log("\n-> Configure environment variables:");
+      const privateKey = await prompt("PRIVATE_KEY (server wallet, 0x...)");
+      const rpcUrl = await prompt("RPC_URL", "https://rpc.gnosischain.com");
+      const portVal = await prompt("PORT", "11256");
+      if (!privateKey) {
+        console.log("  WARNING: PRIVATE_KEY not set -- POST /api/create will fail");
+      }
+      const envLines = [
+        `PORT=${portVal}`,
+        `RPC_URL=${rpcUrl}`,
+        privateKey ? `PRIVATE_KEY=${privateKey}` : "# PRIVATE_KEY=0x...",
+      ].join("\n");
+      const writeCode = await ssh.runShell(`
+        set -e
+        cat <<'ENVEOF' | sudo tee ${ENV_FILE} >/dev/null
+${envLines}
+ENVEOF
+        sudo chown webauthn:webauthn ${ENV_FILE}
+        sudo chmod 0600 ${ENV_FILE}
+      `);
+      if (writeCode !== 0) throw new Error("failed to write env file");
+      console.log("  Env file updated");
+    }
+
     console.log("-> Installing sudoers...");
     await installSudoers(ssh, target.user);
 
