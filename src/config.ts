@@ -1,7 +1,6 @@
 /**
- * Global config from CLI args. No .env needed.
- *
- * Usage: deno task start -- --port 11256 --private-key 0x...
+ * Global config from environment variables.
+ * Deployed via .env file written by `deno task deploy`.
  */
 
 export interface AppConfig {
@@ -14,14 +13,13 @@ export interface AppConfig {
 
 let config: AppConfig;
 
-export function initConfig(args: string[] = Deno.args): AppConfig {
-  const parsed = parseArgs(args);
+export function initConfig(): AppConfig {
   config = {
-    port: parseInt(parsed["port"] ?? "11256"),
-    privateKey: parsed["private-key"] ?? "",
-    queueDbPath: parsed["queue-db"] ?? "queue.db",
-    telegramBotToken: parsed["telegram-bot-token"] ?? "",
-    telegramChatId: parsed["telegram-chat-id"] ?? "",
+    port: parseInt(Deno.env.get("PORT") || "11256"),
+    privateKey: Deno.env.get("PRIVATE_KEY") || "",
+    queueDbPath: Deno.env.get("QUEUE_DB_PATH") || "queue.db",
+    telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN") || "",
+    telegramChatId: Deno.env.get("TELEGRAM_CHAT_ID") || "",
   };
   return config;
 }
@@ -29,16 +27,4 @@ export function initConfig(args: string[] = Deno.args): AppConfig {
 export function getConfig(): AppConfig {
   if (!config) throw new Error("Config not initialized. Call initConfig() first.");
   return config;
-}
-
-function parseArgs(args: string[]): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg.startsWith("--") && i + 1 < args.length && !args[i + 1].startsWith("--")) {
-      result[arg.slice(2)] = args[i + 1];
-      i++;
-    }
-  }
-  return result;
 }

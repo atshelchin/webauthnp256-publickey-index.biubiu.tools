@@ -1,4 +1,4 @@
-import { initConfig, getConfig } from "./src/config.ts";
+import { initConfig } from "./src/config.ts";
 import { initRpc } from "./src/rpc.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge } from "./src/routes/challenge.ts";
@@ -8,7 +8,6 @@ import { initQueue, startQueueWorker } from "./src/queue.ts";
 
 const HOME_HTML = await Deno.readTextFile(new URL("./src/index.html", import.meta.url));
 
-// Parse CLI args: --port 11256 --private-key 0x... --queue-db queue.db ...
 const config = initConfig();
 await initRpc();
 initQueue(config.queueDbPath);

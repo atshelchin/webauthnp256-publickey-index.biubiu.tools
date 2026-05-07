@@ -148,35 +148,38 @@ async function runDeploy(cfg: DeployConfig) {
     console.log("-> Creating directories...");
     await ensureDirectories(ssh);
 
-    // Prompt for service args on first deploy or if args file missing
-    const argsCheck = await ssh.runCapture(["bash", "-lc", `test -f ${DATA_DIR}/args && echo found || echo missing`]);
-    if (state.firstTime || argsCheck.stdout.trim() === "missing") {
-      console.log("\n-> Configure service parameters:");
-      const portVal = await prompt("Port", "11256");
-      const privateKey = await prompt("Private key (server wallet, 0x...)");
-      const telegramBotToken = await prompt("Telegram bot token (optional)");
-      const telegramChatId = await prompt("Telegram chat ID (optional)");
+    // Prompt for .env on first deploy or if .env missing
+    const envPath = `${DATA_DIR}/.env`;
+    const envCheck = await ssh.runCapture(["bash", "-lc", `test -f ${envPath} && echo found || echo missing`]);
+    if (state.firstTime || envCheck.stdout.trim() === "missing") {
+      console.log("\n-> Configure environment variables:");
+      const portVal = await prompt("PORT", "11256");
+      const privateKey = await prompt("PRIVATE_KEY (server wallet, 0x...)");
+      const queueDbPath = `${DATA_DIR}/queue.db`;
+      const telegramBotToken = await prompt("TELEGRAM_BOT_TOKEN (optional)");
+      const telegramChatId = await prompt("TELEGRAM_CHAT_ID (optional)");
       if (!privateKey) {
-        console.log("  WARNING: private key not set -- POST /api/create will fail");
+        console.log("  WARNING: PRIVATE_KEY not set -- POST /api/create will fail");
       }
 
-      const argParts = [
-        `--port ${portVal}`,
-        `--queue-db ${DATA_DIR}/queue.db`,
-      ];
-      if (privateKey) argParts.push(`--private-key ${privateKey}`);
-      if (telegramBotToken) argParts.push(`--telegram-bot-token ${telegramBotToken}`);
-      if (telegramChatId) argParts.push(`--telegram-chat-id ${telegramChatId}`);
-      const argsStr = argParts.join(" ");
+      const envLines = [
+        `PORT=${portVal}`,
+        `QUEUE_DB_PATH=${queueDbPath}`,
+        privateKey ? `PRIVATE_KEY=${privateKey}` : "# PRIVATE_KEY=0x...",
+        telegramBotToken ? `TELEGRAM_BOT_TOKEN=${telegramBotToken}` : "# TELEGRAM_BOT_TOKEN=",
+        telegramChatId ? `TELEGRAM_CHAT_ID=${telegramChatId}` : "# TELEGRAM_CHAT_ID=",
+      ].join("\n");
 
       const writeCode = await ssh.runShell(`
         set -e
-        echo '${argsStr}' | sudo tee ${DATA_DIR}/args >/dev/null
-        sudo chown webauthn:webauthn ${DATA_DIR}/args
-        sudo chmod 0600 ${DATA_DIR}/args
+        cat <<'ENVEOF' | sudo tee ${envPath} >/dev/null
+${envLines}
+ENVEOF
+        sudo chown webauthn:webauthn ${envPath}
+        sudo chmod 0600 ${envPath}
       `);
-      if (writeCode !== 0) throw new Error("failed to write args file");
-      console.log("  Args saved");
+      if (writeCode !== 0) throw new Error("failed to write .env file");
+      console.log("  .env saved");
     }
 
     // Cloudflare Tunnel
@@ -199,13 +202,11 @@ async function runDeploy(cfg: DeployConfig) {
     const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
     await uploadRelease(ssh, repoRoot, releaseDir);
 
-    // Install systemd unit (inject args from data/args file)
+    // Install systemd unit
     console.log("-> Installing systemd unit...");
     const unitPath = `${repoRoot}/deploy/systemd/${SYSTEMD_UNIT}`;
-    const unitTemplate = await Deno.readTextFile(unitPath);
-    const argsContent = await ssh.runCapture(["bash", "-lc", `cat ${DATA_DIR}/args 2>/dev/null || echo ""`]);
-    const unitFinal = unitTemplate.replace("__ARGS__", argsContent.stdout.trim());
-    const b64 = bytesToBase64(new TextEncoder().encode(unitFinal));
+    const unitBytes = await Deno.readFile(unitPath);
+    const b64 = bytesToBase64(unitBytes);
     const installCode = await ssh.runShell(`
       set -e
       printf '%s' '${b64}' | base64 -d > /tmp/${SYSTEMD_UNIT}
