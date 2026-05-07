@@ -43,10 +43,10 @@ export async function handleCreate(req: Request): Promise<Response> {
     ["VelaWalletV1", publicKeyHex],
   );
 
-  // Check if already exists on-chain
+  // Already exists on-chain — return success (idempotent)
   const existing = await getPublicKey(rpId, credentialId);
   if (existing) {
-    return Response.json({ error: "public key already exists" }, { status: 409 });
+    return Response.json({ ...existing, status: "done" }, { status: 201 });
   }
 
   // Check if already in queue
