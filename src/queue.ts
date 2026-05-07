@@ -117,6 +117,66 @@ export function findDuplicate(rpId: string, credentialId: string): QueueItem | n
   ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
 }
 
+// --- Telegram Notifications ---
+
+const ALERT_INTERVAL = 5 * 60_000; // check every 5 minutes
+const QUEUE_BACKLOG_THRESHOLD = 100;
+const GAS_BALANCE_THRESHOLD = 0.01; // xDAI
+const MAX_GAS_PRICE_GWEI = 0.01;
+let lastAlertAt = 0;
+
+async function sendTelegram(message: string): Promise<void> {
+  const { telegramBotToken: botToken, telegramChatId: chatId } = getConfig();
+  if (!botToken || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: message }),
+    });
+  } catch { /* ignore send failures */ }
+}
+
+async function checkAlerts(): Promise<void> {
+  const now = Date.now();
+  if (now - lastAlertAt < ALERT_INTERVAL) return;
+  lastAlertAt = now;
+
+  const alerts: string[] = [];
+
+  // 1. Queue backlog
+  const pending = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committing', 'committed', 'creating')").get() as unknown as { count: number }).count;
+  if (pending >= QUEUE_BACKLOG_THRESHOLD) {
+    alerts.push(`⚠️ Queue backlog: ${pending} items pending`);
+  }
+
+  // 2. Failed items needing manual intervention
+  const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
+  if (failed > 0) {
+    alerts.push(`🔴 ${failed} items permanently failed, need manual intervention`);
+  }
+
+  // 3. Gas balance + gas price check
+  try {
+    const client = getClient();
+    const wallet = getWallet();
+    const balance = await client.getBalance({ address: wallet.account.address });
+    const balanceXdai = Number(balance) / 1e18;
+    if (balanceXdai < GAS_BALANCE_THRESHOLD) {
+      alerts.push(`🪫 Gas balance low: ${balanceXdai.toFixed(6)} xDAI (wallet: ${wallet.account.address})`);
+    }
+    const gasPrice = await client.getGasPrice();
+    const gasPriceGwei = Number(gasPrice) / 1e9;
+    if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
+      alerts.push(`⛽ Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), queue paused`);
+    }
+  } catch { /* ignore check failures */ }
+
+  if (alerts.length > 0) {
+    await sendTelegram(`[webauthnp256-publickey-index]\n${alerts.join("\n")}`);
+  }
+}
+
 // --- Worker ---
 
 let workerRunning = false;
@@ -132,8 +192,19 @@ export function startQueueWorker() {
 async function processQueue() {
   workerRunning = true;
   try {
+    // Check gas price before processing
+    const client = getClient();
+    const gasPrice = await client.getGasPrice();
+    const gasPriceGwei = Number(gasPrice) / 1e9;
+    if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
+      console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), pausing`);
+      await checkAlerts();
+      return;
+    }
+
     await processPending();
     await processCommitted();
+    await checkAlerts();
   } finally {
     workerRunning = false;
   }
@@ -216,6 +287,8 @@ function handleFailure(item: QueueItem, error: string) {
 import { createPublicClient, createWalletClient, http, keccak256, encodeAbiParameters, type Abi } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { gnosis } from "viem/chains";
+import { getCurrentRpc } from "./rpc.ts";
+import { getConfig } from "./config.ts";
 
 const CONTRACT_ADDRESS = "0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b" as const;
 
@@ -243,21 +316,17 @@ const writeAbi = [
   },
 ] as const satisfies Abi;
 
-function getRpcUrl(): string {
-  return Deno.env.get("RPC_URL") || "https://rpc.gnosischain.com";
-}
-
 function getClient() {
-  return createPublicClient({ chain: gnosis, transport: http(getRpcUrl()) });
+  return createPublicClient({ chain: gnosis, transport: http(getCurrentRpc()) });
 }
 
 function getWallet() {
-  const pk = Deno.env.get("PRIVATE_KEY");
-  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
+  const pk = getConfig().privateKey;
+  if (!pk) throw new Error("Missing config: --private-key");
   return createWalletClient({
     account: privateKeyToAccount(pk as `0x${string}`),
     chain: gnosis,
-    transport: http(getRpcUrl()),
+    transport: http(getCurrentRpc()),
   });
 }
 

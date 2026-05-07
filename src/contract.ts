@@ -1,5 +1,6 @@
 import { createPublicClient, http, type Abi } from "viem";
 import { gnosis } from "viem/chains";
+import { getCurrentRpc } from "./rpc.ts";
 
 const abi = [
   {
@@ -83,14 +84,10 @@ const abi = [
 
 const CONTRACT_ADDRESS = "0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b" as const;
 
-function getRpcUrl(): string {
-  return Deno.env.get("RPC_URL") || "https://rpc.gnosischain.com";
-}
-
 function getClient() {
   return createPublicClient({
     chain: gnosis,
-    transport: http(getRpcUrl()),
+    transport: http(getCurrentRpc()),
   });
 }
 

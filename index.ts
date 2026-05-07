@@ -1,3 +1,5 @@
+import { initConfig, getConfig } from "./src/config.ts";
+import { initRpc } from "./src/rpc.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge } from "./src/routes/challenge.ts";
 import { handleCreate, handleCreateStatus } from "./src/routes/create.ts";
@@ -6,7 +8,10 @@ import { initQueue, startQueueWorker } from "./src/queue.ts";
 
 const HOME_HTML = await Deno.readTextFile(new URL("./src/index.html", import.meta.url));
 
-initQueue(Deno.env.get("QUEUE_DB_PATH") || "queue.db");
+// Parse CLI args: --port 11256 --private-key 0x... --queue-db queue.db ...
+const config = initConfig();
+await initRpc();
+initQueue(config.queueDbPath);
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -21,9 +26,7 @@ function withCors(response: Response): Response {
   return response;
 }
 
-const port = parseInt(Deno.env.get("PORT") || "11256", 10);
-
-const server = Deno.serve({ port }, async (req) => {
+const server = Deno.serve({ port: config.port }, async (req) => {
   if (req.method === "OPTIONS") {
     return withCors(new Response(null, { status: 204 }));
   }
@@ -63,7 +66,7 @@ const server = Deno.serve({ port }, async (req) => {
   return withCors(response);
 });
 
-console.log(`Server running at http://localhost:${port}`);
+console.log(`Server running at http://localhost:${config.port}`);
 startQueueWorker();
 
 export { server };

@@ -18,9 +18,8 @@ import {
 import { createSshSession } from "./deploy/ssh.ts";
 import {
   CURRENT_LINK,
-  ENV_FILE,
+  DATA_DIR,
   ensureDirectories,
-  ensureEnvFile,
   ensureServiceUser,
   installDeno,
   installSudoers,
@@ -143,34 +142,36 @@ async function runDeploy(cfg: DeployConfig) {
     await ensureServiceUser(ssh);
     console.log("-> Creating directories...");
     await ensureDirectories(ssh);
-    console.log("-> Ensuring env file...");
-    await ensureEnvFile(ssh);
 
-    // Prompt for env vars on first deploy or if PRIVATE_KEY is missing
-    const envCheck = await ssh.runCapture(["bash", "-lc", `grep -q '^PRIVATE_KEY=' ${ENV_FILE} 2>/dev/null && echo found || echo missing`]);
-    if (state.firstTime || envCheck.stdout.trim() === "missing") {
-      console.log("\n-> Configure environment variables:");
-      const privateKey = await prompt("PRIVATE_KEY (server wallet, 0x...)");
-      const rpcUrl = await prompt("RPC_URL", "https://rpc.gnosischain.com");
-      const portVal = await prompt("PORT", "11256");
+    // Prompt for service args on first deploy or if args file missing
+    const argsCheck = await ssh.runCapture(["bash", "-lc", `test -f ${DATA_DIR}/args && echo found || echo missing`]);
+    if (state.firstTime || argsCheck.stdout.trim() === "missing") {
+      console.log("\n-> Configure service parameters:");
+      const portVal = await prompt("Port", "11256");
+      const privateKey = await prompt("Private key (server wallet, 0x...)");
+      const telegramBotToken = await prompt("Telegram bot token (optional)");
+      const telegramChatId = await prompt("Telegram chat ID (optional)");
       if (!privateKey) {
-        console.log("  WARNING: PRIVATE_KEY not set -- POST /api/create will fail");
+        console.log("  WARNING: private key not set -- POST /api/create will fail");
       }
-      const envLines = [
-        `PORT=${portVal}`,
-        `RPC_URL=${rpcUrl}`,
-        privateKey ? `PRIVATE_KEY=${privateKey}` : "# PRIVATE_KEY=0x...",
-      ].join("\n");
+
+      const argParts = [
+        `--port ${portVal}`,
+        `--queue-db ${DATA_DIR}/queue.db`,
+      ];
+      if (privateKey) argParts.push(`--private-key ${privateKey}`);
+      if (telegramBotToken) argParts.push(`--telegram-bot-token ${telegramBotToken}`);
+      if (telegramChatId) argParts.push(`--telegram-chat-id ${telegramChatId}`);
+      const argsStr = argParts.join(" ");
+
       const writeCode = await ssh.runShell(`
         set -e
-        cat <<'ENVEOF' | sudo tee ${ENV_FILE} >/dev/null
-${envLines}
-ENVEOF
-        sudo chown webauthn:webauthn ${ENV_FILE}
-        sudo chmod 0600 ${ENV_FILE}
+        echo '${argsStr}' | sudo tee ${DATA_DIR}/args >/dev/null
+        sudo chown webauthn:webauthn ${DATA_DIR}/args
+        sudo chmod 0600 ${DATA_DIR}/args
       `);
-      if (writeCode !== 0) throw new Error("failed to write env file");
-      console.log("  Env file updated");
+      if (writeCode !== 0) throw new Error("failed to write args file");
+      console.log("  Args saved");
     }
 
     console.log("-> Installing sudoers...");
@@ -183,11 +184,13 @@ ENVEOF
     const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
     await uploadRelease(ssh, repoRoot, releaseDir);
 
-    // Install systemd unit
+    // Install systemd unit (inject args from data/args file)
     console.log("-> Installing systemd unit...");
     const unitPath = `${repoRoot}/deploy/systemd/${SYSTEMD_UNIT}`;
-    const unitBytes = await Deno.readFile(unitPath);
-    const b64 = bytesToBase64(unitBytes);
+    const unitTemplate = await Deno.readTextFile(unitPath);
+    const argsContent = await ssh.runCapture(["bash", "-lc", `cat ${DATA_DIR}/args 2>/dev/null || echo ""`]);
+    const unitFinal = unitTemplate.replace("__ARGS__", argsContent.stdout.trim());
+    const b64 = bytesToBase64(new TextEncoder().encode(unitFinal));
     const installCode = await ssh.runShell(`
       set -e
       printf '%s' '${b64}' | base64 -d > /tmp/${SYSTEMD_UNIT}

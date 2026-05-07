@@ -3,7 +3,6 @@ import type { SshSession } from "./ssh.ts";
 export const SERVICE_USER = "webauthn";
 export const INSTALL_ROOT = "/opt/webauthnp256-publickey-index";
 export const DATA_DIR = `${INSTALL_ROOT}/data`;
-export const ENV_FILE = `${DATA_DIR}/app.env`;
 export const RELEASES_DIR = `${INSTALL_ROOT}/releases`;
 export const CURRENT_LINK = `${INSTALL_ROOT}/current`;
 
@@ -59,24 +58,6 @@ export async function ensureDirectories(ssh: SshSession): Promise<void> {
     sudo chmod 0755 ${sh(INSTALL_ROOT)}
   `);
   if (code !== 0) throw new Error("failed to create directories");
-}
-
-export async function ensureEnvFile(ssh: SshSession): Promise<void> {
-  const code = await ssh.runShell(`
-    set -e
-    if [ ! -f ${sh(ENV_FILE)} ]; then
-      sudo install -o ${SERVICE_USER} -g ${SERVICE_USER} -m 0600 /dev/null ${sh(ENV_FILE)}
-      cat <<'ENVEOF' | sudo tee ${sh(ENV_FILE)} >/dev/null
-# webauthnp256-publickey-index configuration
-PORT=11256
-RPC_URL=https://rpc.gnosischain.com
-# PRIVATE_KEY=0x...
-ENVEOF
-    fi
-    sudo chown ${SERVICE_USER}:${SERVICE_USER} ${sh(ENV_FILE)}
-    sudo chmod 0600 ${sh(ENV_FILE)}
-  `);
-  if (code !== 0) throw new Error("failed to ensure env file");
 }
 
 export async function installSudoers(ssh: SshSession, deployUser: string): Promise<void> {

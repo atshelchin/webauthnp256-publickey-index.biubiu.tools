@@ -8,12 +8,11 @@ Type=simple
 User=webauthn
 Group=webauthn
 WorkingDirectory=/opt/webauthnp256-publickey-index/current
-ExecStart=/usr/bin/env deno task start
+ExecStart=/usr/bin/env deno task start -- __ARGS__
 
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=/opt/webauthnp256-publickey-index/data
 Environment=NO_COLOR=1
-EnvironmentFile=-/opt/webauthnp256-publickey-index/data/app.env
 
 Restart=on-failure
 RestartSec=3s
