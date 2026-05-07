@@ -7,6 +7,7 @@ export interface DeployTarget {
   user: string;
   authMethod: AuthMethod;
   keyPath?: string;
+  lastDomain?: string;
   lastDeployedAt?: string;
   lastReleaseTag?: string;
 }

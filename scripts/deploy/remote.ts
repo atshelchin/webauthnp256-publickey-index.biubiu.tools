@@ -90,7 +90,7 @@ export async function uploadRelease(ssh: SshSession, repoRoot: string, releaseDi
   const isMac = Deno.build.os === "darwin";
   const tarArgs = ["-czf", "-", "-C", repoRoot];
   if (isMac) tarArgs.push("--no-mac-metadata");
-  tarArgs.push("src", "deno.json");
+  tarArgs.push("index.ts", "src", "deno.json");
   try {
     await Deno.stat(`${repoRoot}/deno.lock`);
     tarArgs.push("deno.lock");
