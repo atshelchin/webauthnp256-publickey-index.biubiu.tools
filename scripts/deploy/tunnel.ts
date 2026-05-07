@@ -1,15 +1,18 @@
 /**
  * Cloudflare Tunnel -- HTTPS without opening firewall ports.
+ * Cert is stored per zone to avoid cross-zone conflicts.
  */
 import type { SshSession } from "./ssh.ts";
 
 function sh(s: string): string { return "'" + s.replace(/'/g, "'\\''") + "'"; }
 
-const CERT_PATH = "/root/.cloudflared/webauthn-cert.pem";
-
 function extractZone(domain: string): string {
   const parts = domain.split(".");
   return parts.slice(-2).join(".");
+}
+
+function certPathForZone(zone: string): string {
+  return `/root/.cloudflared/cert-${zone.replace(/\./g, "-")}.pem`;
 }
 
 export async function ensureCloudflaredInstalled(ssh: SshSession): Promise<void> {
@@ -41,10 +44,12 @@ export async function ensureCloudflaredInstalled(ssh: SshSession): Promise<void>
 
 export async function ensureLoggedIn(ssh: SshSession, domain: string): Promise<void> {
   const targetZone = extractZone(domain);
+  const certPath = certPathForZone(targetZone);
 
-  const probe = await ssh.runCapture(["bash", "-lc", `test -f ${CERT_PATH}`]);
+  // Check if cert for this zone already exists
+  const probe = await ssh.runCapture(["bash", "-lc", `test -f ${certPath}`]);
   if (probe.code === 0) {
-    console.log(`  Using existing cert: ${CERT_PATH}`);
+    console.log(`  Using existing cert for ${targetZone}: ${certPath}`);
     return;
   }
 
@@ -54,6 +59,7 @@ export async function ensureLoggedIn(ssh: SshSession, domain: string): Promise<v
     `  log in to Cloudflare, and select "${targetZone}" as the zone.\n`,
   );
 
+  // Backup existing default cert
   const defaultCert = "/root/.cloudflared/cert.pem";
   await ssh.runShell(
     `[ -f ${defaultCert} ] && cp ${defaultCert} ${defaultCert}.bak || true`,
@@ -69,19 +75,25 @@ export async function ensureLoggedIn(ssh: SshSession, domain: string): Promise<v
     );
   }
 
-  await ssh.runShell(`cp ${defaultCert} ${CERT_PATH}`, { stdio: "null" });
+  // Save cert with zone-specific name
+  await ssh.runShell(`cp ${defaultCert} ${certPath}`, { stdio: "null" });
+
+  // Restore previous default cert
   await ssh.runShell(
     `[ -f ${defaultCert}.bak ] && mv ${defaultCert}.bak ${defaultCert} || true`,
     { stdio: "null" },
   );
 
-  console.log(`  Cloudflare login successful -- cert saved to ${CERT_PATH}`);
+  console.log(`  Cloudflare login successful -- cert saved to ${certPath}`);
 }
 
 export async function setupTunnel(ssh: SshSession, domain: string, localPort: number): Promise<string> {
-  const tunnelName = `webauthn-${extractZone(domain).replace(/\./g, "-")}`;
-  const certFlag = `--origincert ${CERT_PATH}`;
+  const zone = extractZone(domain);
+  const certPath = certPathForZone(zone);
+  const tunnelName = `webauthn-${zone.replace(/\./g, "-")}`;
+  const certFlag = `--origincert ${certPath}`;
 
+  // List existing tunnels
   const listed = await ssh.runCapture(
     ["bash", "-lc", `cloudflared ${certFlag} tunnel list --output json 2>/dev/null || echo '[]'`],
   );
@@ -103,10 +115,11 @@ export async function setupTunnel(ssh: SshSession, domain: string, localPort: nu
     console.log(`  Using existing tunnel: ${tunnelName} (${tunnelId})`);
   }
 
+  // Write tunnel config
   const configYml = [
     `tunnel: ${tunnelId}`,
     `credentials-file: /root/.cloudflared/${tunnelId}.json`,
-    `origincert: ${CERT_PATH}`,
+    `origincert: ${certPath}`,
     `ingress:`,
     `  - hostname: ${domain}`,
     `    service: http://127.0.0.1:${localPort}`,
@@ -120,16 +133,19 @@ export async function setupTunnel(ssh: SshSession, domain: string, localPort: nu
     printf %s ${sh(b64)} | base64 -d > /etc/cloudflared/config.yml
   `);
 
+  // Route DNS
   const routeResult = await ssh.runCapture(
     ["bash", "-lc", `cloudflared ${certFlag} tunnel route dns ${sh(tunnelName)} ${sh(domain)} 2>&1`],
   );
   const routeOutput = routeResult.stdout + routeResult.stderr;
-  if (routeResult.code === 0 || routeOutput.includes("already configured")) {
-    console.log(`  DNS: ${domain} -> tunnel ${tunnelName}`);
+  if (routeResult.code !== 0 && !routeOutput.includes("already configured")) {
+    console.error(`  DNS route failed: ${routeOutput.trim()}`);
+    console.error(`  You may need to manually delete conflicting DNS records in Cloudflare Dashboard`);
   } else {
-    console.error(`  DNS route issue: ${routeOutput.trim()}`);
+    console.log(`  DNS: ${domain} -> tunnel ${tunnelName}`);
   }
 
+  // Install/restart cloudflared service
   const svcProbe = await ssh.runCapture(["bash", "-lc", "systemctl list-unit-files cloudflared.service --no-pager"]);
   if (!/cloudflared\.service/.test(svcProbe.stdout)) {
     await ssh.runShell("cloudflared --config /etc/cloudflared/config.yml service install");
