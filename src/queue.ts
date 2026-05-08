@@ -262,25 +262,46 @@ async function processCommitted() {
   ).all(BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
-  console.log(`[queue] Creating ${items.length} committed items on-chain...`);
+
+  // Check each item's commit block to ensure REVEAL_DELAY has passed
+  const client = getPublicClient();
+  const currentBlock = await client.getBlockNumber();
+  const ready: QueueItem[] = [];
+  for (const item of items) {
+    const { commitment } = buildCommitment(item);
+    const commitBlock = await client.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: "getCommitBlock",
+      args: [commitment],
+    });
+    if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
+      ready.push(item);
+    } else {
+      console.log(`[queue] Item ${item.id} waiting for reveal delay (commit block: ${commitBlock}, current: ${currentBlock})`);
+    }
+  }
+
+  if (ready.length === 0) return;
+  console.log(`[queue] Creating ${ready.length} committed items on-chain...`);
 
   // Mark as creating
-  for (const item of items) {
+  for (const item of ready) {
     db.prepare("UPDATE create_queue SET status = 'creating', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
   }
 
   // Batch createRecord - fire all in parallel
   const results = await Promise.allSettled(
-    items.map((item) => createItem(item))
+    ready.map((item) => createItem(item))
   );
 
-  for (let i = 0; i < items.length; i++) {
+  for (let i = 0; i < ready.length; i++) {
     const result = results[i];
     if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
-        .run(result.value, Date.now(), items[i].id);
+        .run(result.value, Date.now(), ready[i].id);
     } else {
-      handleFailure(items[i], result.reason?.message ?? "create failed");
+      handleFailure(ready[i], result.reason?.message ?? "create failed");
     }
   }
 }
