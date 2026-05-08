@@ -263,8 +263,8 @@ async function processPending() {
 
 async function processCommitted() {
   const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'committed' ORDER BY createdAt ASC LIMIT ?"
-  ).all(BATCH_SIZE) as unknown as QueueItem[];
+    "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
 
@@ -282,6 +282,23 @@ async function processCommitted() {
     });
     if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
       ready.push(item);
+    } else if (commitBlock === 0n) {
+      // Commitment doesn't exist — maybe already consumed or never committed
+      // Check if record already exists on-chain
+      const exists = await client.readContract({
+        address: CONTRACT_ADDRESS,
+        abi: CONTRACT_ABI,
+        functionName: "hasRecord",
+        args: [item.rpId, item.credentialId],
+      });
+      if (exists) {
+        db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+        console.log(`[queue] Item ${item.id} already on-chain, marking done`);
+      } else {
+        // Need to re-commit
+        db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+        console.warn(`[queue] Item ${item.id} commitment missing, resetting to pending`);
+      }
     } else {
       console.log(`[queue] Item ${item.id} waiting for reveal delay (commit block: ${commitBlock}, current: ${currentBlock})`);
     }
@@ -306,12 +323,13 @@ async function processCommitted() {
       db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
         .run(result.value, Date.now(), ready[i].id);
     } else {
-      handleFailure(ready[i], result.reason?.message ?? "create failed");
+      // Reset to 'committed' (not 'pending') to avoid re-committing and wasting gas
+      handleFailure(ready[i], result.reason?.message ?? "create failed", "committed");
     }
   }
 }
 
-function handleFailure(item: QueueItem, error: string) {
+function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | "committed" = "pending") {
   const retries = item.retries + 1;
   if (retries >= MAX_RETRIES) {
     db.prepare("UPDATE create_queue SET status = 'failed', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
@@ -321,9 +339,9 @@ function handleFailure(item: QueueItem, error: string) {
     // Exponential backoff: 5s, 15s, 45s, 2m, 6m, 20m, 1h, 3h, 9h, 12h
     const delay = Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
     const retryAfter = Date.now() + delay;
-    db.prepare("UPDATE create_queue SET status = 'pending', error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
-      .run(error, retries, retryAfter, Date.now(), item.id);
-    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s): ${error}`);
+    db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
+      .run(retryStatus, error, retries, retryAfter, Date.now(), item.id);
+    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s, reset to ${retryStatus}): ${error}`);
   }
 }
 

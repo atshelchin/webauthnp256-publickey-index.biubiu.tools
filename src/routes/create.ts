@@ -95,6 +95,7 @@ export function handleCreateStatus(req: Request): Response {
     id: item.id,
     status: item.status,
     rpId: item.rpId,
+    publicKey: item.publicKey,
     name: item.name,
     error: item.error || undefined,
     createdAt: item.createdAt,
