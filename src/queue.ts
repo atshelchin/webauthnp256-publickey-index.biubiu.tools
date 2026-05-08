@@ -88,6 +88,12 @@ export function initQueue(dbPath = "queue.db") {
     )
   `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
+
+  // Migration: add walletRef column if missing (for databases created before V2)
+  const columns = db.prepare("PRAGMA table_info(create_queue)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "walletRef")) {
+    db.exec("ALTER TABLE create_queue ADD COLUMN walletRef TEXT NOT NULL DEFAULT ''");
+  }
 }
 
 export function getQueueDb(): Database {
