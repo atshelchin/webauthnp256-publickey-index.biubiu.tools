@@ -76,15 +76,26 @@ export function handleCreateStatus(req: Request): Response {
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
+  // Only expose full data after on-chain (done/failed), redact during commit-reveal to prevent front-running
+  if (item.status === "done") {
+    return Response.json({
+      id: item.id,
+      status: item.status,
+      rpId: item.rpId,
+      credentialId: item.credentialId,
+      walletRef: item.walletRef,
+      publicKey: item.publicKey,
+      name: item.name,
+      txHash: item.txHash,
+      createdAt: item.createdAt,
+    });
+  }
+
   return Response.json({
     id: item.id,
     status: item.status,
     rpId: item.rpId,
-    credentialId: item.credentialId,
-    walletRef: item.walletRef,
-    publicKey: item.publicKey,
     name: item.name,
-    txHash: item.txHash || undefined,
     error: item.error || undefined,
     createdAt: item.createdAt,
   });

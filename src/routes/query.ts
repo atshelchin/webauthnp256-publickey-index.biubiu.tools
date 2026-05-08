@@ -45,16 +45,12 @@ export async function handleQuery(req: Request): Promise<Response> {
   }
 
   // Fallback: check queue for pending/in-progress records
+  // Redact sensitive fields to prevent front-running before createRecord
   const queued = findDuplicate(rpId, credentialId);
   if (queued) {
     return Response.json({
       rpId: queued.rpId,
-      credentialId: queued.credentialId,
-      walletRef: queued.walletRef,
-      publicKey: queued.publicKey,
       name: queued.name,
-      initialCredentialId: queued.initialCredentialId,
-      metadata: queued.metadata,
       createdAt: queued.createdAt,
       _queue: { id: queued.id, status: queued.status },
     });

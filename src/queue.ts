@@ -17,6 +17,7 @@ export interface QueueItem {
   txHash: string;
   error: string;
   retries: number;
+  retryAfter: number;
   ip: string;
   createdAt: number;
   updatedAt: number;
@@ -82,6 +83,7 @@ export function initQueue(dbPath = "queue.db") {
       txHash TEXT NOT NULL DEFAULT '',
       error TEXT NOT NULL DEFAULT '',
       retries INTEGER NOT NULL DEFAULT 0,
+      retryAfter INTEGER NOT NULL DEFAULT 0,
       ip TEXT NOT NULL DEFAULT '',
       createdAt INTEGER NOT NULL,
       updatedAt INTEGER NOT NULL
@@ -89,10 +91,13 @@ export function initQueue(dbPath = "queue.db") {
   `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
 
-  // Migration: add walletRef column if missing (for databases created before V2)
+  // Migrations for existing databases
   const columns = db.prepare("PRAGMA table_info(create_queue)").all() as unknown as { name: string }[];
   if (!columns.some((c) => c.name === "walletRef")) {
     db.exec("ALTER TABLE create_queue ADD COLUMN walletRef TEXT NOT NULL DEFAULT ''");
+  }
+  if (!columns.some((c) => c.name === "retryAfter")) {
+    db.exec("ALTER TABLE create_queue ADD COLUMN retryAfter INTEGER NOT NULL DEFAULT 0");
   }
 }
 
@@ -229,8 +234,8 @@ async function processQueue() {
 
 async function processPending() {
   const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'pending' ORDER BY createdAt ASC LIMIT ?"
-  ).all(BATCH_SIZE) as unknown as QueueItem[];
+    "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
   console.log(`[queue] Processing ${items.length} pending items...`);
@@ -313,10 +318,12 @@ function handleFailure(item: QueueItem, error: string) {
       .run(error, retries, Date.now(), item.id);
     console.error(`[queue] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
   } else {
-    // Reset to pending for retry
-    db.prepare("UPDATE create_queue SET status = 'pending', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
-      .run(error, retries, Date.now(), item.id);
-    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}): ${error}`);
+    // Exponential backoff: 5s, 20s, 80s
+    const delay = 5000 * Math.pow(4, retries - 1);
+    const retryAfter = Date.now() + delay;
+    db.prepare("UPDATE create_queue SET status = 'pending', error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
+      .run(error, retries, retryAfter, Date.now(), item.id);
+    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s): ${error}`);
   }
 }
 
