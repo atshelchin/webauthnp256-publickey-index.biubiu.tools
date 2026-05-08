@@ -25,7 +25,7 @@ export interface QueueItem {
 
 // --- Config ---
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 10;
 const WORKER_INTERVAL = 2000; // 2s
 const BATCH_SIZE = 50;
 
@@ -135,7 +135,7 @@ export function getQueueItem(id: string): QueueItem | null {
 
 export function findDuplicate(rpId: string, credentialId: string): QueueItem | null {
   return (db.prepare(
-    "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? AND status NOT IN ('failed') ORDER BY createdAt DESC LIMIT 1"
+    "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY createdAt DESC LIMIT 1"
   ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
 }
 
@@ -318,8 +318,8 @@ function handleFailure(item: QueueItem, error: string) {
       .run(error, retries, Date.now(), item.id);
     console.error(`[queue] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
   } else {
-    // Exponential backoff: 5s, 20s, 80s
-    const delay = 5000 * Math.pow(4, retries - 1);
+    // Exponential backoff: 5s, 15s, 45s, 2m, 6m, 20m, 1h, 3h, 9h, 12h
+    const delay = Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
     const retryAfter = Date.now() + delay;
     db.prepare("UPDATE create_queue SET status = 'pending', error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
       .run(error, retries, retryAfter, Date.now(), item.id);

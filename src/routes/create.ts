@@ -55,7 +55,7 @@ export async function handleCreate(req: Request): Promise<Response> {
 
   // Check if already in queue
   const queued = findDuplicate(rpId, credentialId);
-  if (queued) {
+  if (queued && queued.status !== "failed") {
     return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
   }
 
