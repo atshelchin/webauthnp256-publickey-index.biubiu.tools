@@ -1,5 +1,6 @@
 import { assertEquals, assert } from "@std/assert/";
 import { cacheClear } from "./cache.ts";
+import { initQueue } from "./queue.ts";
 import { handleQuery } from "./routes/query.ts";
 import { handleCreate } from "./routes/create.ts";
 import { handleListRpIds, handleListPublicKeys } from "./routes/stats.ts";
@@ -13,6 +14,7 @@ try {
 
 function setup() {
   cacheClear();
+  initQueue(":memory:");
 }
 
 const CORS_HEADERS = {

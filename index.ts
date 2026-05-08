@@ -3,7 +3,7 @@ import { initRpc } from "./src/rpc.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge } from "./src/routes/challenge.ts";
 import { handleCreate, handleCreateStatus } from "./src/routes/create.ts";
-import { handleListRpIds, handleListPublicKeys } from "./src/routes/stats.ts";
+import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "./src/routes/stats.ts";
 import { initQueue, startQueueWorker } from "./src/queue.ts";
 
 const HOME_HTML = await Deno.readTextFile(new URL("./src/index.html", import.meta.url));
@@ -50,6 +50,8 @@ const server = Deno.serve({ port: config.port }, async (req) => {
       response = await handleCreate(req);
     } else if (path.startsWith("/api/create/") && req.method === "GET") {
       response = handleCreateStatus(req);
+    } else if (path === "/api/stats/total" && req.method === "GET") {
+      response = await handleTotalCredentials();
     } else if (path === "/api/stats/sites" && req.method === "GET") {
       response = await handleListRpIds(req);
     } else if (path === "/api/stats/keys" && req.method === "GET") {

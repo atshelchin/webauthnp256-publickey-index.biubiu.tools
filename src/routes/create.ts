@@ -1,11 +1,13 @@
 import { getPublicKey } from "../contract.ts";
 import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
+import { buildWalletRef } from "../wallet-ref.ts";
 
 export async function handleCreate(req: Request): Promise<Response> {
   let body: {
     rpId?: string;
     credentialId?: string;
+    walletRef?: string;
     publicKey?: string;
     name?: string;
     initialCredentialId?: string;
@@ -28,16 +30,18 @@ export async function handleCreate(req: Request): Promise<Response> {
     );
   }
 
-  // Rate limit by IP
+  // Rate limit by IP (hashed for GDPR)
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
     || req.headers.get("x-real-ip")
     || "unknown";
-  if (!checkRateLimit(ip)) {
+  if (!await checkRateLimit(ip)) {
     return Response.json({ error: "rate limit exceeded, max 5 requests per minute" }, { status: 429 });
   }
 
   const initialCredentialId = body.initialCredentialId || credentialId;
   const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
+  // walletRef: optional, default to Safe address derived from publicKey
+  const walletRef = body.walletRef || buildWalletRef(publicKey);
   const metadata = body.metadata || encodeAbiParameters(
     [{ type: "string" }, { type: "bytes" }],
     ["VelaWalletV1", publicKeyHex],
@@ -56,7 +60,7 @@ export async function handleCreate(req: Request): Promise<Response> {
   }
 
   // Enqueue
-  const id = enqueue({ rpId, credentialId, publicKey, name, initialCredentialId, metadata, ip });
+  const id = await enqueue({ rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip });
   return Response.json({ id, status: "pending" }, { status: 202 });
 }
 
@@ -77,6 +81,7 @@ export function handleCreateStatus(req: Request): Response {
     status: item.status,
     rpId: item.rpId,
     credentialId: item.credentialId,
+    walletRef: item.walletRef,
     publicKey: item.publicKey,
     name: item.name,
     txHash: item.txHash || undefined,

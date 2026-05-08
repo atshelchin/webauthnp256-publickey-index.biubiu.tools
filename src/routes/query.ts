@@ -1,4 +1,4 @@
-import { getPublicKey } from "../contract.ts";
+import { getPublicKey, getPublicKeyByWalletRef } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 import { findDuplicate } from "../queue.ts";
 
@@ -8,9 +8,27 @@ export async function handleQuery(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const rpId = url.searchParams.get("rpId");
   const credentialId = url.searchParams.get("credentialId");
+  const walletRef = url.searchParams.get("walletRef");
 
+  // Query by walletRef
+  if (walletRef) {
+    const cacheKey = `query:walletRef:${walletRef}`;
+    const cached = cacheGet<object>(cacheKey);
+    if (cached) {
+      return Response.json(cached, { headers: CACHE_HEADERS });
+    }
+
+    const result = await getPublicKeyByWalletRef(walletRef as `0x${string}`);
+    if (result) {
+      cacheSet(cacheKey, result);
+      return Response.json(result, { headers: CACHE_HEADERS });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  // Query by rpId + credentialId (backward compatible)
   if (!rpId || !credentialId) {
-    return Response.json({ error: "rpId and credentialId are required" }, { status: 400 });
+    return Response.json({ error: "rpId and credentialId are required (or walletRef)" }, { status: 400 });
   }
 
   const cacheKey = `query:${rpId}:${credentialId}`;
@@ -32,6 +50,7 @@ export async function handleQuery(req: Request): Promise<Response> {
     return Response.json({
       rpId: queued.rpId,
       credentialId: queued.credentialId,
+      walletRef: queued.walletRef,
       publicKey: queued.publicKey,
       name: queued.name,
       initialCredentialId: queued.initialCredentialId,

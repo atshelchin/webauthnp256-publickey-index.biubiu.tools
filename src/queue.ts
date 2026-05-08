@@ -9,6 +9,7 @@ export interface QueueItem {
   status: QueueStatus;
   rpId: string;
   credentialId: string;
+  walletRef: string;
   publicKey: string;
   name: string;
   initialCredentialId: string;
@@ -33,13 +34,20 @@ const RATE_WINDOW = 60_000; // 1 minute
 const RATE_LIMIT = 5; // max requests per IP per window
 const ipRequests = new Map<string, number[]>(); // ip -> timestamps
 
-export function checkRateLimit(ip: string): boolean {
+async function hashIp(ip: string): Promise<string> {
+  const data = new TextEncoder().encode(ip);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+export async function checkRateLimit(ip: string): Promise<boolean> {
+  const hashed = await hashIp(ip);
   const now = Date.now();
-  const timestamps = ipRequests.get(ip) ?? [];
+  const timestamps = ipRequests.get(hashed) ?? [];
   const recent = timestamps.filter((t) => now - t < RATE_WINDOW);
   if (recent.length >= RATE_LIMIT) return false;
   recent.push(now);
-  ipRequests.set(ip, recent);
+  ipRequests.set(hashed, recent);
   return true;
 }
 
@@ -66,6 +74,7 @@ export function initQueue(dbPath = "queue.db") {
       status TEXT NOT NULL DEFAULT 'pending',
       rpId TEXT NOT NULL,
       credentialId TEXT NOT NULL,
+      walletRef TEXT NOT NULL,
       publicKey TEXT NOT NULL,
       name TEXT NOT NULL,
       initialCredentialId TEXT NOT NULL,
@@ -89,21 +98,23 @@ function generateId(): string {
   return crypto.randomUUID();
 }
 
-export function enqueue(params: {
+export async function enqueue(params: {
   rpId: string;
   credentialId: string;
+  walletRef: string;
   publicKey: string;
   name: string;
   initialCredentialId: string;
   metadata: string;
   ip: string;
-}): string {
+}): Promise<string> {
   const id = generateId();
   const now = Date.now();
+  const ipHash = await hashIp(params.ip);
   db.prepare(`
-    INSERT INTO create_queue (id, status, rpId, credentialId, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
-    VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, params.rpId, params.credentialId, params.publicKey, params.name, params.initialCredentialId, params.metadata, params.ip, now, now);
+    INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
+    VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, params.rpId, params.credentialId, params.walletRef, params.publicKey, params.name, params.initialCredentialId, params.metadata, ipHash, now, now);
   return id;
 }
 
@@ -158,7 +169,7 @@ async function checkAlerts(): Promise<void> {
 
   // 3. Gas balance + gas price check
   try {
-    const client = getClient();
+    const client = getPublicClient();
     const wallet = getWallet();
     const balance = await client.getBalance({ address: wallet.account.address });
     const balanceXdai = Number(balance) / 1e18;
@@ -193,7 +204,7 @@ async function processQueue() {
   workerRunning = true;
   try {
     // Check gas price before processing
-    const client = getClient();
+    const client = getPublicClient();
     const gasPrice = await client.getGasPrice();
     const gasPriceGwei = Number(gasPrice) / 1e9;
     if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
@@ -282,15 +293,14 @@ function handleFailure(item: QueueItem, error: string) {
   }
 }
 
-// --- On-chain operations (extracted from contract.ts for granular control) ---
+// --- On-chain operations ---
 
-import { createPublicClient, createWalletClient, http, keccak256, encodeAbiParameters, type Abi } from "viem";
+import { createWalletClient, http, keccak256, encodeAbiParameters } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { gnosis } from "viem/chains";
 import { getCurrentRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
-
-const CONTRACT_ADDRESS = "0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b" as const;
+import { getClient as getPublicClient, CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
 
 const writeAbi = [
   {
@@ -306,6 +316,7 @@ const writeAbi = [
     inputs: [
       { name: "rpId", type: "string" },
       { name: "credentialId", type: "string" },
+      { name: "walletRef", type: "bytes32" },
       { name: "publicKey", type: "bytes" },
       { name: "name", type: "string" },
       { name: "initialCredentialId", type: "string" },
@@ -314,15 +325,11 @@ const writeAbi = [
     outputs: [],
     stateMutability: "nonpayable",
   },
-] as const satisfies Abi;
-
-function getClient() {
-  return createPublicClient({ chain: gnosis, transport: http(getCurrentRpc()) });
-}
+] as const;
 
 function getWallet() {
   const pk = getConfig().privateKey;
-  if (!pk) throw new Error("Missing config: --private-key");
+  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
   return createWalletClient({
     account: privateKeyToAccount(pk as `0x${string}`),
     chain: gnosis,
@@ -330,19 +337,40 @@ function getWallet() {
   });
 }
 
-async function commitItem(item: QueueItem): Promise<void> {
-  const client = getClient();
-  const wallet = getWallet();
-
+function buildCommitment(item: QueueItem) {
+  const walletRefHex = item.walletRef as `0x${string}`;
   const publicKeyHex = (item.publicKey.startsWith("0x") ? item.publicKey : `0x${item.publicKey}`) as `0x${string}`;
   const metadataHex = (item.metadata.startsWith("0x") ? item.metadata : `0x${item.metadata}`) as `0x${string}`;
 
-  const commitment = keccak256(
-    encodeAbiParameters(
-      [{ type: "string" }, { type: "string" }, { type: "bytes" }, { type: "string" }, { type: "string" }, { type: "bytes" }],
-      [item.rpId, item.credentialId, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+  return {
+    commitment: keccak256(
+      encodeAbiParameters(
+        [{ type: "string" }, { type: "string" }, { type: "bytes32" }, { type: "bytes" }, { type: "string" }, { type: "string" }, { type: "bytes" }],
+        [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+      ),
     ),
-  );
+    walletRefHex,
+    publicKeyHex,
+    metadataHex,
+  };
+}
+
+async function commitItem(item: QueueItem): Promise<void> {
+  const client = getPublicClient();
+  const wallet = getWallet();
+  const { commitment } = buildCommitment(item);
+
+  // Check if already committed on-chain
+  const commitBlock = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    abi: CONTRACT_ABI,
+    functionName: "getCommitBlock",
+    args: [commitment],
+  });
+  if (commitBlock > 0n) {
+    console.log(`[queue] Item ${item.id} already committed at block ${commitBlock}, skipping commit`);
+    return;
+  }
 
   const hash = await wallet.writeContract({
     address: CONTRACT_ADDRESS,
@@ -354,17 +382,15 @@ async function commitItem(item: QueueItem): Promise<void> {
 }
 
 async function createItem(item: QueueItem): Promise<string> {
-  const client = getClient();
+  const client = getPublicClient();
   const wallet = getWallet();
-
-  const publicKeyHex = (item.publicKey.startsWith("0x") ? item.publicKey : `0x${item.publicKey}`) as `0x${string}`;
-  const metadataHex = (item.metadata.startsWith("0x") ? item.metadata : `0x${item.metadata}`) as `0x${string}`;
+  const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
 
   const hash = await wallet.writeContract({
     address: CONTRACT_ADDRESS,
     abi: writeAbi,
     functionName: "createRecord",
-    args: [item.rpId, item.credentialId, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+    args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
   });
   await client.waitForTransactionReceipt({ hash });
   return hash;

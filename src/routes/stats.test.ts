@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert/";
 import { cacheClear } from "../cache.ts";
-import { handleListRpIds, handleListPublicKeys } from "./stats.ts";
+import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "./stats.ts";
 
 function setup() {
   cacheClear();
@@ -33,6 +33,16 @@ Deno.test("handleListRpIds clamps pageSize to max 100", async () => {
   const res = await handleListRpIds(req);
   const body = await res.json();
   assertEquals(body.pageSize, 100);
+});
+
+// --- handleTotalCredentials ---
+
+Deno.test("handleTotalCredentials returns total count", async () => {
+  setup();
+  const res = await handleTotalCredentials();
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals(typeof body.totalCredentials, "number");
 });
 
 // --- handleListPublicKeys ---

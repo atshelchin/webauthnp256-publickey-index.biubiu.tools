@@ -17,6 +17,29 @@ const abi = [
         components: [
           { name: "rpId", type: "string" },
           { name: "credentialId", type: "string" },
+          { name: "walletRef", type: "bytes32" },
+          { name: "publicKey", type: "bytes" },
+          { name: "name", type: "string" },
+          { name: "initialCredentialId", type: "string" },
+          { name: "metadata", type: "bytes" },
+          { name: "createdAt", type: "uint256" },
+        ],
+      },
+    ],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getRecordByWalletRef",
+    inputs: [{ name: "walletRef", type: "bytes32" }],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          { name: "rpId", type: "string" },
+          { name: "credentialId", type: "string" },
+          { name: "walletRef", type: "bytes32" },
           { name: "publicKey", type: "bytes" },
           { name: "name", type: "string" },
           { name: "initialCredentialId", type: "string" },
@@ -35,6 +58,20 @@ const abi = [
       { name: "credentialId", type: "string" },
     ],
     outputs: [{ name: "", type: "bool" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getCommitBlock",
+    inputs: [{ name: "commitment", type: "bytes32" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getTotalCredentials",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
   },
   {
@@ -70,6 +107,7 @@ const abi = [
         components: [
           { name: "rpId", type: "string" },
           { name: "credentialId", type: "string" },
+          { name: "walletRef", type: "bytes32" },
           { name: "publicKey", type: "bytes" },
           { name: "name", type: "string" },
           { name: "initialCredentialId", type: "string" },
@@ -82,9 +120,10 @@ const abi = [
   },
 ] as const satisfies Abi;
 
-const CONTRACT_ADDRESS = "0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b" as const;
+export const CONTRACT_ADDRESS = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3" as const;
+export const CONTRACT_ABI = abi;
 
-function getClient() {
+export function getClient() {
   return createPublicClient({
     chain: gnosis,
     transport: http(getCurrentRpc()),
@@ -94,6 +133,19 @@ function getClient() {
 // Strip leading "0x" from viem hex bytes
 function stripHexPrefix(hex: string): string {
   return hex.startsWith("0x") ? hex.slice(2) : hex;
+}
+
+function formatRecord(record: { rpId: string; credentialId: string; walletRef: string; publicKey: string; name: string; initialCredentialId: string; metadata: string; createdAt: bigint }) {
+  return {
+    rpId: record.rpId,
+    credentialId: record.credentialId,
+    walletRef: record.walletRef,
+    publicKey: stripHexPrefix(record.publicKey),
+    name: record.name,
+    initialCredentialId: record.initialCredentialId,
+    metadata: stripHexPrefix(record.metadata),
+    createdAt: Number(record.createdAt) * 1000,
+  };
 }
 
 // --- Query ---
@@ -117,18 +169,36 @@ export async function getPublicKey(rpId: string, credentialId: string) {
     args: [rpId, credentialId],
   });
 
-  return {
-    rpId: record.rpId,
-    credentialId: record.credentialId,
-    publicKey: stripHexPrefix(record.publicKey),
-    name: record.name,
-    initialCredentialId: record.initialCredentialId,
-    metadata: stripHexPrefix(record.metadata),
-    createdAt: Number(record.createdAt) * 1000,
-  };
+  return formatRecord(record);
+}
+
+export async function getPublicKeyByWalletRef(walletRef: `0x${string}`) {
+  const client = getClient();
+
+  try {
+    const record = await client.readContract({
+      address: CONTRACT_ADDRESS,
+      abi,
+      functionName: "getRecordByWalletRef",
+      args: [walletRef],
+    });
+    return formatRecord(record);
+  } catch {
+    return null;
+  }
 }
 
 // --- Stats ---
+
+export async function getTotalCredentials(): Promise<number> {
+  const client = getClient();
+  const total = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    abi,
+    functionName: "getTotalCredentials",
+  });
+  return Number(total);
+}
 
 export async function listRpIds(page: number, pageSize: number, order: "asc" | "desc" = "desc") {
   const client = getClient();
@@ -161,15 +231,7 @@ export async function listPublicKeysByRpId(rpId: string, page: number, pageSize:
     args: [rpId, BigInt(offset), BigInt(pageSize), order === "desc"],
   });
 
-  const items = records.map((r) => ({
-    rpId: r.rpId,
-    credentialId: r.credentialId,
-    publicKey: stripHexPrefix(r.publicKey),
-    name: r.name,
-    initialCredentialId: r.initialCredentialId,
-    metadata: stripHexPrefix(r.metadata),
-    createdAt: Number(r.createdAt) * 1000,
-  }));
+  const items = records.map((r) => formatRecord(r));
 
   return { total: Number(total), page, pageSize, items };
 }

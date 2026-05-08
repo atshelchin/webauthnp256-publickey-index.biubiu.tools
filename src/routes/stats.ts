@@ -1,4 +1,4 @@
-import { listRpIds, listPublicKeysByRpId } from "../contract.ts";
+import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
@@ -25,6 +25,19 @@ export async function handleListRpIds(req: Request): Promise<Response> {
     cacheSet(cacheKey, result);
   }
   return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
+}
+
+export async function handleTotalCredentials(): Promise<Response> {
+  const cacheKey = "stats:totalCredentials";
+  const cached = cacheGet<object>(cacheKey);
+  if (cached) {
+    return Response.json(cached, { headers: CACHE_HEADERS });
+  }
+
+  const total = await getTotalCredentials();
+  const result = { totalCredentials: total };
+  cacheSet(cacheKey, result);
+  return Response.json(result, { headers: CACHE_HEADERS });
 }
 
 export async function handleListPublicKeys(req: Request): Promise<Response> {
