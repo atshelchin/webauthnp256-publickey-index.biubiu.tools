@@ -1,79 +1,59 @@
-import { test, expect, beforeEach } from "bun:test";
-import { cacheGet, cacheSet, cacheInvalidateByRpId, cacheClear, cacheSize, cacheMemoryUsage } from "./cache.ts";
+import { assertEquals, assert } from "@std/assert/";
+import { cacheGet, cacheSet, cacheClear, cacheSize, cacheMemoryUsage } from "./cache.ts";
 
-beforeEach(() => {
+function setup() {
   cacheClear();
+}
+
+Deno.test("cacheGet returns undefined for missing key", () => {
+  setup();
+  assertEquals(cacheGet("missing"), undefined);
 });
 
-test("cacheGet returns undefined for missing key", () => {
-  expect(cacheGet("missing")).toBeUndefined();
-});
-
-test("cacheSet and cacheGet round-trip", () => {
+Deno.test("cacheSet and cacheGet round-trip", () => {
+  setup();
   cacheSet("key1", { data: "hello" });
-  expect(cacheGet("key1")).toEqual({ data: "hello" });
+  assertEquals(cacheGet("key1"), { data: "hello" });
 });
 
-test("cacheInvalidateByRpId clears matching query keys", () => {
-  cacheSet("query:example.com:cred1", { pk: "04abc" });
-  cacheSet("query:other.com:cred1", { pk: "04def" });
-
-  cacheInvalidateByRpId("example.com");
-
-  expect(cacheGet("query:example.com:cred1")).toBeUndefined();
-  expect(cacheGet("query:other.com:cred1")).not.toBeUndefined();
-});
-
-test("cacheInvalidateByRpId clears stats keys", () => {
-  cacheSet("stats:rpIds:1:10:desc", { total: 1 });
-  cacheSet("stats:keys:example.com:1:10:desc", { total: 1 });
-
-  cacheInvalidateByRpId("example.com");
-
-  expect(cacheGet("stats:rpIds:1:10:desc")).toBeUndefined();
-  expect(cacheGet("stats:keys:example.com:1:10:desc")).toBeUndefined();
-});
-
-test("cacheClear removes all entries", () => {
+Deno.test("cacheClear removes all entries", () => {
+  setup();
   cacheSet("a", 1);
   cacheSet("b", 2);
   cacheClear();
-  expect(cacheSize()).toBe(0);
+  assertEquals(cacheSize(), 0);
 });
 
-test("cacheSize returns correct count", () => {
-  expect(cacheSize()).toBe(0);
+Deno.test("cacheSize returns correct count", () => {
+  setup();
+  assertEquals(cacheSize(), 0);
   cacheSet("a", 1);
   cacheSet("b", 2);
-  expect(cacheSize()).toBe(2);
+  assertEquals(cacheSize(), 2);
 });
 
 // --- Memory usage & eviction ---
 
-test("cacheMemoryUsage tracks size", () => {
-  expect(cacheMemoryUsage()).toBe(0);
+Deno.test("cacheMemoryUsage tracks size", () => {
+  setup();
+  assertEquals(cacheMemoryUsage(), 0);
   cacheSet("k1", { data: "hello" });
-  expect(cacheMemoryUsage()).toBeGreaterThan(0);
+  assert(cacheMemoryUsage() > 0);
 });
 
-test("cacheMemoryUsage resets after cacheClear", () => {
+Deno.test("cacheMemoryUsage resets after cacheClear", () => {
+  setup();
   cacheSet("k1", { data: "hello" });
   cacheClear();
-  expect(cacheMemoryUsage()).toBe(0);
+  assertEquals(cacheMemoryUsage(), 0);
 });
 
-test("cacheSet overwrites existing key and updates size", () => {
+Deno.test("cacheSet overwrites existing key and updates size", () => {
+  setup();
   cacheSet("k1", "short");
   const size1 = cacheMemoryUsage();
   cacheSet("k1", "a much longer string value here");
   const size2 = cacheMemoryUsage();
-  expect(size2).toBeGreaterThan(size1);
-  expect(cacheSize()).toBe(1);
-});
-
-test("cacheInvalidateByRpId decreases memory usage", () => {
-  cacheSet("query:x.com:c1", { pk: "04abc" });
-  const before = cacheMemoryUsage();
-  cacheInvalidateByRpId("x.com");
-  expect(cacheMemoryUsage()).toBeLessThan(before);
+  assert(size2 > size1);
+  assertEquals(cacheSize(), 1);
 });

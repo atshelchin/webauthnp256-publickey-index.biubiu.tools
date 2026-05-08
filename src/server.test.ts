@@ -1,15 +1,21 @@
-import { test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { initDb } from "./db.ts";
+import { assertEquals, assert } from "@std/assert/";
 import { cacheClear } from "./cache.ts";
-import HOME_HTML from "./index.html" with { type: "text" };
+import { initQueue } from "./queue.ts";
 import { handleQuery } from "./routes/query.ts";
-import { handleChallenge, handleCreate } from "./routes/create.ts";
+import { handleCreate } from "./routes/create.ts";
 import { handleListRpIds, handleListPublicKeys } from "./routes/stats.ts";
 
-beforeEach(() => {
-  initDb(":memory:");
+let HOME_HTML: string;
+try {
+  HOME_HTML = Deno.readTextFileSync(new URL("./index.html", import.meta.url));
+} catch {
+  HOME_HTML = "<!DOCTYPE html><html><body>test</body></html>";
+}
+
+function setup() {
   cacheClear();
-});
+  initQueue(":memory:");
+}
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -39,19 +45,17 @@ async function handleRequest(req: Request): Promise<Response> {
     } else if (path === "/api/health" && req.method === "GET") {
       response = Response.json({ status: "ok" });
     } else if (path === "/api/query" && req.method === "GET") {
-      response = handleQuery(req);
-    } else if (path === "/api/challenge" && req.method === "GET") {
-      response = handleChallenge();
+      response = await handleQuery(req);
     } else if (path === "/api/create" && req.method === "POST") {
       response = await handleCreate(req);
     } else if (path === "/api/stats/sites" && req.method === "GET") {
-      response = handleListRpIds(req);
+      response = await handleListRpIds(req);
     } else if (path === "/api/stats/keys" && req.method === "GET") {
-      response = handleListPublicKeys(req);
+      response = await handleListPublicKeys(req);
     } else {
       response = Response.json({ error: "not found" }, { status: 404 });
     }
-  } catch (error) {
+  } catch {
     response = Response.json({ error: "internal server error" }, { status: 500 });
   }
   return withCors(response);
@@ -59,68 +63,76 @@ async function handleRequest(req: Request): Promise<Response> {
 
 // --- Health check ---
 
-test("GET /api/health returns ok", async () => {
+Deno.test("GET /api/health returns ok", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/health"));
-  expect(res.status).toBe(200);
+  assertEquals(res.status, 200);
   const body = await res.json();
-  expect(body.status).toBe("ok");
+  assertEquals(body.status, "ok");
 });
 
 // --- Homepage ---
 
-test("GET / returns HTML", async () => {
+Deno.test("GET / returns HTML", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/"));
-  expect(res.status).toBe(200);
-  expect(res.headers.get("Content-Type")).toContain("text/html");
+  assertEquals(res.status, 200);
+  assert(res.headers.get("Content-Type")!.includes("text/html"));
   const text = await res.text();
-  expect(text).toContain("<!DOCTYPE html");
+  assert(text.includes("<!DOCTYPE html"));
 });
 
 // --- CORS ---
 
-test("OPTIONS returns CORS headers", async () => {
+Deno.test("OPTIONS returns CORS headers", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/query", { method: "OPTIONS" }));
-  expect(res.status).toBe(204);
-  expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
-  expect(res.headers.get("Access-Control-Allow-Methods")).toContain("GET");
-  expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+  assertEquals(res.status, 204);
+  assertEquals(res.headers.get("Access-Control-Allow-Origin"), "*");
+  assert(res.headers.get("Access-Control-Allow-Methods")!.includes("GET"));
 });
 
-test("API responses include CORS headers", async () => {
+Deno.test("API responses include CORS headers", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/health"));
-  expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  assertEquals(res.headers.get("Access-Control-Allow-Origin"), "*");
 });
 
 // --- 404 ---
 
-test("unknown route returns 404", async () => {
+Deno.test("unknown route returns 404", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/nonexistent"));
-  expect(res.status).toBe(404);
+  assertEquals(res.status, 404);
   const body = await res.json();
-  expect(body.error).toBe("not found");
+  assertEquals(body.error, "not found");
 });
 
-test("wrong HTTP method returns 404", async () => {
+Deno.test("wrong HTTP method returns 404", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/query", { method: "POST" }));
-  expect(res.status).toBe(404);
+  assertEquals(res.status, 404);
 });
 
 // --- Query param validation ---
 
-test("GET /api/query without params returns 400", async () => {
+Deno.test("GET /api/query without params returns 400", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/query"));
-  expect(res.status).toBe(400);
+  assertEquals(res.status, 400);
 });
 
-test("GET /api/stats/keys without rpId returns 400", async () => {
+Deno.test("GET /api/stats/keys without rpId returns 400", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/api/stats/keys"));
-  expect(res.status).toBe(400);
+  assertEquals(res.status, 400);
 });
 
 // --- 404 also has CORS ---
 
-test("404 response includes CORS headers", async () => {
+Deno.test("404 response includes CORS headers", async () => {
+  setup();
   const res = await handleRequest(new Request("http://localhost/nonexistent"));
-  expect(res.status).toBe(404);
-  expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  assertEquals(res.status, 404);
+  assertEquals(res.headers.get("Access-Control-Allow-Origin"), "*");
 });

@@ -1,22 +1,17 @@
-import { createPublicKey, getPublicKey } from "../db.ts";
-import { cacheInvalidateByRpId } from "../cache.ts";
-import { generateChallenge, consumeChallenge, verifyWebAuthnSignature } from "../challenge.ts";
-
-export function handleChallenge(): Response {
-  const challenge = generateChallenge();
-  return Response.json({ challenge });
-}
+import { getPublicKey } from "../contract.ts";
+import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
+import { encodeAbiParameters } from "viem";
+import { buildWalletRef } from "../wallet-ref.ts";
 
 export async function handleCreate(req: Request): Promise<Response> {
   let body: {
     rpId?: string;
     credentialId?: string;
+    walletRef?: string;
     publicKey?: string;
-    challenge?: string;
-    signature?: string;
-    authenticatorData?: string;
-    clientDataJSON?: string;
     name?: string;
+    initialCredentialId?: string;
+    metadata?: string;
   };
 
   try {
@@ -25,32 +20,84 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { rpId, credentialId, publicKey, challenge, signature, authenticatorData, clientDataJSON } = body;
+  const name = body.name;
+  const { rpId, credentialId, publicKey } = body;
 
-  if (!rpId || !credentialId || !publicKey || !challenge || !signature || !authenticatorData || !clientDataJSON) {
+  if (!rpId || !credentialId || !publicKey || !name) {
     return Response.json(
-      { error: "rpId, credentialId, publicKey, challenge, signature, authenticatorData, and clientDataJSON are required" },
-      { status: 400 }
+      { error: "rpId, credentialId, publicKey, and name are required" },
+      { status: 400 },
     );
   }
 
-  if (!consumeChallenge(challenge)) {
-    return Response.json({ error: "invalid or expired challenge" }, { status: 400 });
+  // Rate limit by IP (hashed for GDPR)
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    || req.headers.get("x-real-ip")
+    || "unknown";
+  if (!await checkRateLimit(ip)) {
+    return Response.json({ error: "rate limit exceeded, max 5 requests per minute" }, { status: 429 });
   }
 
-  const verification = verifyWebAuthnSignature(publicKey, challenge, signature, authenticatorData, clientDataJSON);
-  if (!verification.ok) {
-    return Response.json({ error: `signature verification failed: ${verification.error}` }, { status: 400 });
-  }
+  const initialCredentialId = body.initialCredentialId || credentialId;
+  const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
+  // walletRef: optional, default to Safe address derived from publicKey
+  const walletRef = body.walletRef || buildWalletRef(publicKey);
+  const metadata = body.metadata || encodeAbiParameters(
+    [{ type: "string" }, { type: "bytes" }],
+    ["VelaWalletV1", publicKeyHex],
+  );
 
-  const existing = getPublicKey(rpId, credentialId);
+  // Already exists on-chain — return success (idempotent)
+  const existing = await getPublicKey(rpId, credentialId);
   if (existing) {
-    return Response.json({ error: "public key already exists" }, { status: 409 });
+    return Response.json({ ...existing, status: "done" }, { status: 201 });
   }
 
-  const name = body.name || "";
-  const result = createPublicKey(rpId, credentialId, publicKey, name);
-  cacheInvalidateByRpId(rpId);
+  // Check if already in queue
+  const queued = findDuplicate(rpId, credentialId);
+  if (queued && queued.status !== "failed") {
+    return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
+  }
 
-  return Response.json(result, { status: 201 });
+  // Enqueue
+  const id = await enqueue({ rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip });
+  return Response.json({ id, status: "pending" }, { status: 202 });
+}
+
+export function handleCreateStatus(req: Request): Response {
+  const url = new URL(req.url);
+  const id = url.pathname.split("/").pop();
+  if (!id) {
+    return Response.json({ error: "id is required" }, { status: 400 });
+  }
+
+  const item = getQueueItem(id);
+  if (!item) {
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  // Only expose full data after on-chain (done/failed), redact during commit-reveal to prevent front-running
+  if (item.status === "done") {
+    return Response.json({
+      id: item.id,
+      status: item.status,
+      rpId: item.rpId,
+      credentialId: item.credentialId,
+      walletRef: item.walletRef,
+      publicKey: item.publicKey,
+      name: item.name,
+      txHash: item.txHash,
+      createdAt: item.createdAt,
+    });
+  }
+
+  return Response.json({
+    id: item.id,
+    status: item.status,
+    rpId: item.rpId,
+    publicKey: item.publicKey,
+    name: item.name,
+    error: item.error || undefined,
+    createdAt: item.createdAt,
+  });
 }

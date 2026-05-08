@@ -11,8 +11,10 @@ interface CacheEntry {
 const store = new Map<string, CacheEntry>();
 let totalSize = 0;
 
+const encoder = new TextEncoder();
+
 function estimateSize(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8");
+  return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
 function evictOldest(): void {
@@ -47,15 +49,6 @@ export function cacheSet<T>(key: string, value: T): void {
 
   if (totalSize > MAX_MEMORY_BYTES) {
     evictOldest();
-  }
-}
-
-export function cacheInvalidateByRpId(rpId: string): void {
-  for (const [key, entry] of store) {
-    if (key.startsWith(`query:${rpId}:`) || key.startsWith("stats:")) {
-      totalSize -= entry.size;
-      store.delete(key);
-    }
   }
 }
 

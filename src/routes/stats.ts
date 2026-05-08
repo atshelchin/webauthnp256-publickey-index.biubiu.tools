@@ -1,4 +1,4 @@
-import { listRpIds, listPublicKeysByRpId } from "../db.ts";
+import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
@@ -10,7 +10,7 @@ function parsePagination(url: URL) {
   return { page, pageSize, order };
 }
 
-export function handleListRpIds(req: Request): Response {
+export async function handleListRpIds(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const { page, pageSize, order } = parsePagination(url);
 
@@ -20,14 +20,27 @@ export function handleListRpIds(req: Request): Response {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = listRpIds(page, pageSize, order);
+  const result = await listRpIds(page, pageSize, order);
   if (result.items.length > 0) {
     cacheSet(cacheKey, result);
   }
   return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
 }
 
-export function handleListPublicKeys(req: Request): Response {
+export async function handleTotalCredentials(): Promise<Response> {
+  const cacheKey = "stats:totalCredentials";
+  const cached = cacheGet<object>(cacheKey);
+  if (cached) {
+    return Response.json(cached, { headers: CACHE_HEADERS });
+  }
+
+  const total = await getTotalCredentials();
+  const result = { totalCredentials: total };
+  cacheSet(cacheKey, result);
+  return Response.json(result, { headers: CACHE_HEADERS });
+}
+
+export async function handleListPublicKeys(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const rpId = url.searchParams.get("rpId");
 
@@ -43,7 +56,7 @@ export function handleListPublicKeys(req: Request): Response {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = listPublicKeysByRpId(rpId, page, pageSize, order);
+  const result = await listPublicKeysByRpId(rpId, page, pageSize, order);
   if (result.items.length > 0) {
     cacheSet(cacheKey, result);
   }

@@ -1,0 +1,17 @@
+{
+  "imports": {
+    "viem": "npm:viem@2",
+    "viem/accounts": "npm:viem@2/accounts",
+    "viem/chains": "npm:viem@2/chains",
+    "@std/assert/": "jsr:@std/assert@1/",
+    "@std/assert": "jsr:@std/assert@1",
+    "marked": "npm:marked@17"
+  },
+  "tasks": {
+    "dev": "deno run --watch --allow-net --allow-read=. --allow-write=. --allow-env --unstable-node-globals --env index.ts",
+    "start": "deno run --allow-net --allow-read --allow-write --allow-env --unstable-node-globals index.ts",
+    "test": "deno test --allow-net --allow-read=. --allow-write=. --allow-env --unstable-node-globals",
+    "build": "deno run --allow-read=. --allow-write=src/index.html,dist --allow-run=deno build.ts",
+    "deploy": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts"
+  }
+}
