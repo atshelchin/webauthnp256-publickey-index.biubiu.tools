@@ -53,12 +53,15 @@ async function refreshIfNeeded(): Promise<void> {
 }
 
 export function getCurrentRpc(): string {
-  return rpcList[currentIndex % rpcList.length];
+  const rpc = rpcList[currentIndex % rpcList.length];
+  // Round-robin: advance to next RPC for the next caller
+  currentIndex = (currentIndex + 1) % rpcList.length;
+  return rpc;
 }
 
 export function failover(): string {
+  const next = rpcList[currentIndex % rpcList.length];
   currentIndex = (currentIndex + 1) % rpcList.length;
-  const next = rpcList[currentIndex];
   console.warn(`[rpc] Failover to: ${next}`);
   return next;
 }

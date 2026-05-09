@@ -2,6 +2,7 @@ import { getPublicKey } from "../contract.ts";
 import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../wallet-ref.ts";
+import { cacheGet, cacheSet } from "../cache.ts";
 
 export async function handleCreate(req: Request): Promise<Response> {
   let body: {
@@ -48,8 +49,14 @@ export async function handleCreate(req: Request): Promise<Response> {
   );
 
   // Already exists on-chain — return success (idempotent)
+  const cacheKey = `query:${rpId}:${credentialId}`;
+  const cached = cacheGet<object>(cacheKey);
+  if (cached) {
+    return Response.json({ ...cached, status: "done" }, { status: 201 });
+  }
   const existing = await getPublicKey(rpId, credentialId);
   if (existing) {
+    cacheSet(cacheKey, existing);
     return Response.json({ ...existing, status: "done" }, { status: 201 });
   }
 

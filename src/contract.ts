@@ -153,23 +153,18 @@ function formatRecord(record: { rpId: string; credentialId: string; walletRef: s
 export async function getPublicKey(rpId: string, credentialId: string) {
   const client = getClient();
 
-  const exists = await client.readContract({
-    address: CONTRACT_ADDRESS,
-    abi,
-    functionName: "hasRecord",
-    args: [rpId, credentialId],
-  });
+  try {
+    const record = await client.readContract({
+      address: CONTRACT_ADDRESS,
+      abi,
+      functionName: "getRecord",
+      args: [rpId, credentialId],
+    });
 
-  if (!exists) return null;
-
-  const record = await client.readContract({
-    address: CONTRACT_ADDRESS,
-    abi,
-    functionName: "getRecord",
-    args: [rpId, credentialId],
-  });
-
-  return formatRecord(record);
+    return formatRecord(record);
+  } catch {
+    return null;
+  }
 }
 
 export async function getPublicKeyByWalletRef(walletRef: `0x${string}`) {
