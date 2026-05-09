@@ -20,6 +20,10 @@ let rpcList: string[] = [...FALLBACK_RPCS];
 let currentIndex = 0;
 let lastRefresh = 0;
 
+// Track failed RPCs: url -> timestamp when it failed (cooldown before retry)
+const BAD_RPC_COOLDOWN = 60_000; // 1 minute cooldown for failed RPCs
+const failedRpcs = new Map<string, number>();
+
 async function fetchRpcList(): Promise<string[]> {
   try {
     const res = await fetch(CHAIN_DATA_URL, { signal: AbortSignal.timeout(10_000) });
@@ -52,16 +56,37 @@ async function refreshIfNeeded(): Promise<void> {
   }
 }
 
+function isAvailable(url: string): boolean {
+  const failedAt = failedRpcs.get(url);
+  if (!failedAt) return true;
+  // Allow retry after cooldown
+  if (Date.now() - failedAt > BAD_RPC_COOLDOWN) {
+    failedRpcs.delete(url);
+    return true;
+  }
+  return false;
+}
+
 export function getCurrentRpc(): string {
+  // Round-robin, skipping known-bad RPCs
+  for (let i = 0; i < rpcList.length; i++) {
+    const rpc = rpcList[currentIndex % rpcList.length];
+    currentIndex = (currentIndex + 1) % rpcList.length;
+    if (isAvailable(rpc)) return rpc;
+  }
+  // All marked bad — return any (cooldowns will expire)
   const rpc = rpcList[currentIndex % rpcList.length];
-  // Round-robin: advance to next RPC for the next caller
   currentIndex = (currentIndex + 1) % rpcList.length;
   return rpc;
 }
 
+export function markFailed(url: string): void {
+  failedRpcs.set(url, Date.now());
+  console.warn(`[rpc] Marked as failed (1min cooldown): ${url}`);
+}
+
 export function failover(): string {
-  const next = rpcList[currentIndex % rpcList.length];
-  currentIndex = (currentIndex + 1) % rpcList.length;
+  const next = getCurrentRpc();
   console.warn(`[rpc] Failover to: ${next}`);
   return next;
 }

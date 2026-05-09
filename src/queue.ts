@@ -180,7 +180,7 @@ async function checkAlerts(): Promise<void> {
 
   // 3. Gas balance + gas price check
   try {
-    const client = getPublicClient();
+    const { client } = getPublicClient();
     const wallet = getWallet();
     const balance = await client.getBalance({ address: wallet.account.address });
     const balanceXdai = Number(balance) / 1e18;
@@ -215,7 +215,7 @@ async function processQueue() {
   workerRunning = true;
   try {
     // Check gas price before processing
-    const client = getPublicClient();
+    const { client } = getPublicClient();
     const gasPrice = await client.getGasPrice();
     const gasPriceGwei = Number(gasPrice) / 1e9;
     if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
@@ -269,7 +269,7 @@ async function processCommitted() {
   if (items.length === 0) return;
 
   // Check each item's commit block to ensure REVEAL_DELAY has passed
-  const client = getPublicClient();
+  const { client } = getPublicClient();
   const currentBlock = await client.getBlockNumber();
   const ready: QueueItem[] = [];
   for (const item of items) {
@@ -408,7 +408,7 @@ function buildCommitment(item: QueueItem) {
 }
 
 async function commitItem(item: QueueItem): Promise<void> {
-  const client = getPublicClient();
+  const { client } = getPublicClient();
   const wallet = getWallet();
   const { commitment } = buildCommitment(item);
 
@@ -434,7 +434,7 @@ async function commitItem(item: QueueItem): Promise<void> {
 }
 
 async function createItem(item: QueueItem): Promise<string> {
-  const client = getPublicClient();
+  const { client } = getPublicClient();
   const wallet = getWallet();
   const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
 
