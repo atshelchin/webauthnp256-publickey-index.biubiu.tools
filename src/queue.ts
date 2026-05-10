@@ -146,6 +146,7 @@ const QUEUE_BACKLOG_THRESHOLD = 100;
 const GAS_BALANCE_THRESHOLD = 0.01; // xDAI
 const MAX_GAS_PRICE_GWEI = 0.01;
 let lastAlertAt = 0;
+let lastFailedCount = 0; // only alert when failed count changes
 
 async function sendTelegram(message: string): Promise<void> {
   const { telegramBotToken: botToken, telegramChatId: chatId } = getConfig();
@@ -172,11 +173,12 @@ async function checkAlerts(): Promise<void> {
     alerts.push(`⚠️ Queue backlog: ${pending} items pending`);
   }
 
-  // 2. Failed items needing manual intervention
+  // 2. Failed items needing manual intervention (only alert on change)
   const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
-  if (failed > 0) {
+  if (failed > 0 && failed !== lastFailedCount) {
     alerts.push(`🔴 ${failed} items permanently failed, need manual intervention`);
   }
+  lastFailedCount = failed;
 
   // 3. Gas balance + gas price check
   try {
@@ -350,7 +352,7 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
 import { createWalletClient, http, keccak256, encodeAbiParameters } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { gnosis } from "viem/chains";
-import { getCurrentRpc } from "./rpc.ts";
+import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
 import { getClient as getPublicClient, CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
 
@@ -385,7 +387,7 @@ function getWallet() {
   return createWalletClient({
     account: privateKeyToAccount(pk as `0x${string}`),
     chain: gnosis,
-    transport: http(getCurrentRpc()),
+    transport: http(getWriteRpc()),
   });
 }
 

@@ -16,6 +16,14 @@ const FALLBACK_RPCS = [
   "https://1rpc.io/gnosis",
 ];
 
+// RPCs known to support write operations (sendRawTransaction, pending nonce)
+const WRITE_RPCS = [
+  "https://rpc.gnosischain.com",
+  "https://gnosis-rpc.publicnode.com",
+  "https://gnosis.drpc.org",
+];
+let writeIndex = 0;
+
 let rpcList: string[] = [...FALLBACK_RPCS];
 let currentIndex = 0;
 let lastRefresh = 0;
@@ -77,6 +85,19 @@ export function getCurrentRpc(): string {
   // All marked bad — return any (cooldowns will expire)
   const rpc = rpcList[currentIndex % rpcList.length];
   currentIndex = (currentIndex + 1) % rpcList.length;
+  return rpc;
+}
+
+export function getWriteRpc(): string {
+  // Round-robin over known-good write RPCs, skipping failed ones
+  for (let i = 0; i < WRITE_RPCS.length; i++) {
+    const rpc = WRITE_RPCS[writeIndex % WRITE_RPCS.length];
+    writeIndex = (writeIndex + 1) % WRITE_RPCS.length;
+    if (isAvailable(rpc)) return rpc;
+  }
+  // All marked bad — return first (cooldowns will expire)
+  const rpc = WRITE_RPCS[writeIndex % WRITE_RPCS.length];
+  writeIndex = (writeIndex + 1) % WRITE_RPCS.length;
   return rpc;
 }
 
