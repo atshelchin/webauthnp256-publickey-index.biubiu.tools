@@ -17,11 +17,6 @@ import {
 } from "./deploy/config.ts";
 import { createSshSession } from "./deploy/ssh.ts";
 import {
-  ensureCloudflaredInstalled,
-  ensureLoggedIn,
-  setupTunnel,
-} from "./deploy/tunnel.ts";
-import {
   CURRENT_LINK,
   DATA_DIR,
   ensureDirectories,
@@ -182,16 +177,6 @@ ENVEOF
       console.log("  .env saved");
     }
 
-    // Cloudflare Tunnel
-    const domain = await prompt("Public domain (Cloudflare Tunnel)", target.lastDomain || "webauthnp256-publickey-index.biubiu.tools");
-    if (domain) {
-      console.log("-> Setting up Cloudflare Tunnel...");
-      await ensureCloudflaredInstalled(ssh);
-      await ensureLoggedIn(ssh, domain);
-      await setupTunnel(ssh, domain, HTTP_PORT);
-      target.lastDomain = domain;
-    }
-
     console.log("-> Installing sudoers...");
     await installSudoers(ssh, target.user);
 
@@ -250,9 +235,6 @@ ENVEOF
     console.log(healthy ? "Deploy successful!" : "Service started but health check inconclusive");
     console.log(`  Release: ${tag}`);
     console.log(`  Service: ${SYSTEMD_UNIT}`);
-    if (domain) {
-      console.log(`  URL:     https://${domain}/`);
-    }
     console.log(`  HTTP:    http://${target.host}:${HTTP_PORT}/`);
     console.log("=".repeat(50) + "\n");
   } finally {

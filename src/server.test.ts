@@ -43,7 +43,13 @@ async function handleRequest(req: Request): Promise<Response> {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     } else if (path === "/api/health" && req.method === "GET") {
-      response = Response.json({ status: "ok" });
+      response = Response.json({
+        service: "webauthn-p256-publickey-index",
+        version: "1.0.0",
+        chainId: 100,
+        contract: "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3",
+        status: "ok",
+      });
     } else if (path === "/api/query" && req.method === "GET") {
       response = await handleQuery(req);
     } else if (path === "/api/create" && req.method === "POST") {
@@ -68,6 +74,10 @@ Deno.test("GET /api/health returns ok", async () => {
   const res = await handleRequest(new Request("http://localhost/api/health"));
   assertEquals(res.status, 200);
   const body = await res.json();
+  assertEquals(body.service, "webauthn-p256-publickey-index");
+  assertEquals(body.version, "1.0.0");
+  assertEquals(body.chainId, 100);
+  assertEquals(body.contract, "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3");
   assertEquals(body.status, "ok");
 });
 

@@ -1,5 +1,6 @@
 import { initConfig } from "./src/config.ts";
 import { initRpc } from "./src/rpc.ts";
+import { CONTRACT_ADDRESS } from "./src/contract.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge } from "./src/routes/challenge.ts";
 import { handleCreate, handleCreateStatus } from "./src/routes/create.ts";
@@ -41,7 +42,13 @@ const server = Deno.serve({ port: config.port }, async (req) => {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     } else if (path === "/api/health" && req.method === "GET") {
-      response = Response.json({ status: "ok" });
+      response = Response.json({
+        service: "webauthn-p256-publickey-index",
+        version: "1.0.0",
+        chainId: 100,
+        contract: CONTRACT_ADDRESS,
+        status: "ok",
+      });
     } else if (path === "/api/challenge" && req.method === "GET") {
       response = handleChallenge();
     } else if (path === "/api/query" && req.method === "GET") {
