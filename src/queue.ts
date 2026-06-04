@@ -27,7 +27,8 @@ export interface QueueItem {
 
 const MAX_RETRIES = 10;
 const WORKER_INTERVAL = 2000; // 2s
-const BATCH_SIZE = 100;
+const QUERY_BATCH_SIZE = 100;  // multicall queries — can be large
+const TX_BATCH_SIZE = 20;      // tx sends per cycle — keep small to avoid nonce gaps
 
 // --- Rate Limiting ---
 
@@ -308,7 +309,7 @@ async function processQueue() {
 async function processCreating() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
-  ).all(BATCH_SIZE) as unknown as QueueItem[];
+  ).all(QUERY_BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
 
@@ -348,7 +349,7 @@ async function processCreating() {
 async function processCommitted() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
+  ).all(Date.now(), TX_BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
 
@@ -451,7 +452,7 @@ async function processCommitted() {
 async function processPending() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
+  ).all(Date.now(), TX_BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
   console.log(`[queue] Sending ${items.length} commit txs...`);
