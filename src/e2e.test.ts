@@ -46,7 +46,7 @@ function makeCreateRequest(body: Record<string, unknown>): Request {
   });
 }
 
-async function pollStatus(id: string, timeoutMs = 180_000): Promise<{ status: QueueStatus; txHash?: string }> {
+async function pollStatus(id: string, timeoutMs = 600_000): Promise<{ status: QueueStatus; txHash?: string }> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const item = getQueueItem(id);
