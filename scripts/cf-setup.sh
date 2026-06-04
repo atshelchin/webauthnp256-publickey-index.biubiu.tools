@@ -51,7 +51,7 @@ cat > "$CONFIG_OUTPUT" <<TMPL
     }
   ],
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["* * * * *"]
   }
 }
 TMPL
