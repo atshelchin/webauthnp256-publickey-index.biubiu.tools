@@ -372,19 +372,12 @@ TELEGRAM_CHAT_ID=
 ## 部署 (Cloudflare Workers)
 
 ```bash
-# 1. 安装依赖
-npm install
-
-# 2. 创建 D1 数据库, 将返回的 database_id 填入 wrangler.jsonc
-npx wrangler d1 create webauthnp256-queue
-
-# 3. 设置 Secrets
-npx wrangler secret put PRIVATE_KEY
+npm install                                    # 安装依赖
+npm run setup                                  # 自动创建 D1 数据库, 生成 wrangler.json (幂等)
+npx wrangler secret put PRIVATE_KEY            # 设置 Secrets
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
-
-# 4. 部署
-npm run deploy
+npm run deploy                                 # 部署
 ```
 
 队列处理通过 Durable Object + Alarm 实现 (~10s 间隔), 同时有 Cron Trigger (每 5 分钟) 作为备份确保 DO alarm 运行。

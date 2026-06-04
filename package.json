@@ -2,9 +2,10 @@
   "private": true,
   "description": "Dependencies for Cloudflare Worker build (Deno uses deno.json import map)",
   "scripts": {
+    "setup": "bash scripts/cf-setup.sh",
     "test": "vitest run",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "dev": "wrangler dev -c wrangler.json",
+    "deploy": "wrangler deploy -c wrangler.json"
   },
   "dependencies": {
     "viem": "^2.0.0"
