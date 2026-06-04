@@ -165,6 +165,15 @@ async function sendTelegram(message: string): Promise<void> {
   } catch { /* ignore send failures */ }
 }
 
+const DONE_RETENTION = 7 * 24 * 60 * 60_000; // 7 days
+
+function cleanupDoneRecords(): void {
+  const cutoff = Date.now() - DONE_RETENTION;
+  const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(cutoff);
+  const deleted = (result as unknown as { changes: number }).changes;
+  if (deleted > 0) console.log(`[queue] Cleaned up ${deleted} done records older than 7 days`);
+}
+
 async function checkAlerts(): Promise<void> {
   const now = Date.now();
   if (now - lastAlertAt < ALERT_INTERVAL) return;
@@ -288,13 +297,14 @@ async function processQueue() {
     await processCreating();
     await processCommitted();
     await processPending();
+    cleanupDoneRecords();
     await checkAlerts();
   } finally {
     workerRunning = false;
   }
 }
 
-// Phase 1: Verify items in 'creating' status — check hasRecord on-chain
+// Phase 1: Verify items in 'creating' status — batch hasRecord via multicall
 async function processCreating() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
@@ -303,32 +313,38 @@ async function processCreating() {
   if (items.length === 0) return;
 
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
-  for (const item of items) {
-    try {
-      const exists = await client.readContract({
-        address: CONTRACT_ADDRESS,
-        abi: CONTRACT_ABI,
-        functionName: "hasRecord",
-        args: [item.rpId, item.credentialId],
-      });
-      if (exists) {
-        db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-        console.log(`[queue] Item ${item.id} confirmed on-chain, done`);
-      } else {
-        // Tx may still be pending; if stuck too long, retry
-        const CREATING_TIMEOUT = 2 * 60_000; // 2 minutes
-        if (Date.now() - item.updatedAt > CREATING_TIMEOUT) {
-          // Reset to committed to re-send createRecord
-          handleFailure(item, "createRecord tx not confirmed after 2min", "committed");
+
+  // Single multicall: check hasRecord for all items at once
+  const calls = items.map((item) => ({
+    address: CONTRACT_ADDRESS as `0x${string}`,
+    abi: CONTRACT_ABI,
+    functionName: "hasRecord" as const,
+    args: [item.rpId, item.credentialId] as const,
+  }));
+
+  try {
+    const results = await client.multicall({ contracts: calls });
+    let doneCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const result = results[i];
+      if (result.status === "success" && result.result) {
+        db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
+        doneCount++;
+      } else if (result.status === "success" && !result.result) {
+        const CREATING_TIMEOUT = 2 * 60_000;
+        if (Date.now() - items[i].updatedAt > CREATING_TIMEOUT) {
+          handleFailure(items[i], "createRecord tx not confirmed after 2min", "committed");
         }
       }
-    } catch {
-      // RPC error, skip — will retry next cycle
+      // result.status === "failure" → RPC error for this call, skip
     }
+    if (doneCount > 0) console.log(`[queue] ${doneCount} items confirmed on-chain, done`);
+  } catch {
+    // Entire multicall failed (RPC error), retry next cycle
   }
 }
 
-// Phase 2: Advance committed items — check reveal delay, fire createRecord (no wait)
+// Phase 2: Advance committed items — batch getCommitBlock via multicall, fire createRecord
 async function processCommitted() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
@@ -338,42 +354,62 @@ async function processCommitted() {
 
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
   const currentBlock = await client.getBlockNumber();
+
+  // Single multicall: check getCommitBlock for all items at once
+  const commitments = items.map((item) => buildCommitment(item).commitment);
+  const calls = commitments.map((commitment) => ({
+    address: CONTRACT_ADDRESS as `0x${string}`,
+    abi: CONTRACT_ABI,
+    functionName: "getCommitBlock" as const,
+    args: [commitment] as const,
+  }));
+
+  let results: { status: "success" | "failure"; result?: unknown; error?: unknown }[];
+  try {
+    results = await client.multicall({ contracts: calls }) as typeof results;
+  } catch {
+    return; // multicall failed, retry next cycle
+  }
+
   const ready: QueueItem[] = [];
-  for (const item of items) {
-    const { commitment } = buildCommitment(item);
+  const needsHasRecordCheck: QueueItem[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const result = results[i];
+    if (result.status !== "success") continue;
+    const commitBlock = result.result as bigint;
+    if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
+      ready.push(items[i]);
+    } else if (commitBlock === 0n) {
+      needsHasRecordCheck.push(items[i]);
+    }
+    // commitBlock > 0 but not enough delay → just wait
+  }
+
+  // Batch check hasRecord for items with commitBlock === 0 (maybe already on-chain or never committed)
+  if (needsHasRecordCheck.length > 0) {
+    const hasRecordCalls = needsHasRecordCheck.map((item) => ({
+      address: CONTRACT_ADDRESS as `0x${string}`,
+      abi: CONTRACT_ABI,
+      functionName: "hasRecord" as const,
+      args: [item.rpId, item.credentialId] as const,
+    }));
     try {
-      const commitBlock = await client.readContract({
-        address: CONTRACT_ADDRESS,
-        abi: CONTRACT_ABI,
-        functionName: "getCommitBlock",
-        args: [commitment],
-      });
-      if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
-        ready.push(item);
-      } else if (commitBlock === 0n) {
-        // Check if record already exists on-chain
-        const exists = await client.readContract({
-          address: CONTRACT_ADDRESS,
-          abi: CONTRACT_ABI,
-          functionName: "hasRecord",
-          args: [item.rpId, item.credentialId],
-        });
-        if (exists) {
+      const hasRecordResults = await client.multicall({ contracts: hasRecordCalls });
+      for (let i = 0; i < needsHasRecordCheck.length; i++) {
+        const item = needsHasRecordCheck[i];
+        const r = hasRecordResults[i];
+        if (r.status === "success" && r.result) {
           db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-          console.log(`[queue] Item ${item.id} already on-chain, marking done`);
         } else {
           const COMMIT_COOLDOWN = 2 * 60_000;
-          if (Date.now() - item.updatedAt < COMMIT_COOLDOWN) {
-            // Commit tx may still be pending, wait
-          } else {
+          if (Date.now() - item.updatedAt >= COMMIT_COOLDOWN) {
             db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
             console.warn(`[queue] Item ${item.id} commitment missing after ${COMMIT_COOLDOWN / 1000}s, resetting to pending`);
           }
         }
       }
-    } catch {
-      // RPC error, skip — will retry next cycle
-    }
+    } catch { /* multicall failed, retry next cycle */ }
   }
 
   if (ready.length === 0) return;
@@ -381,9 +417,9 @@ async function processCommitted() {
 
   // Acquire all nonces upfront, then fire all createRecord txs truly in parallel
   const handles = await Promise.all(ready.map(() => acquireNonce("create")));
-  const results = await Promise.allSettled(
+  const { wallet } = getCreateWallet();
+  const txResults = await Promise.allSettled(
     ready.map((item, i) => {
-      const { wallet } = getCreateWallet();
       const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
       return wallet.writeContract({
         address: CONTRACT_ADDRESS,
@@ -397,7 +433,7 @@ async function processCommitted() {
 
   let createSuccess = 0;
   for (let i = 0; i < ready.length; i++) {
-    const result = results[i];
+    const result = txResults[i];
     if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
         .run(result.value, Date.now(), ready[i].id);
