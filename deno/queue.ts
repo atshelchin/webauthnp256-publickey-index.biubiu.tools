@@ -1,9 +1,9 @@
 import { DatabaseSync as Database } from "node:sqlite";
 import { createPublicClient, http } from "viem";
 import { gnosis } from "viem/chains";
-import { getWriteRpc } from "./rpc.ts";
+import { getWriteRpc } from "../shared/rpc.ts";
 import { getConfig } from "./config.ts";
-import { CONTRACT_ADDRESS, CONTRACT_ABI, BATCH_HELPER_ADDRESS, BATCH_ABI } from "./contract-shared.ts";
+import { CONTRACT_ADDRESS, CONTRACT_ABI, BATCH_HELPER_ADDRESS, BATCH_ABI } from "../shared/contract.ts";
 import { acquireNonce } from "./nonce.ts";
 import {
   type QueueStatus,
@@ -27,7 +27,7 @@ import {
   getCreateWallet,
   getCommitWallet,
   sendTelegram,
-} from "./queue-shared.ts";
+} from "../shared/queue.ts";
 
 export type { QueueStatus, QueueItem };
 

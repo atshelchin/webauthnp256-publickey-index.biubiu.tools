@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert/";
-import { cacheClear } from "../cache.ts";
+import { cacheClear } from "../../shared/cache.ts";
 import { initQueue } from "../queue.ts";
-import { handleCreate, handleCreateStatus } from "./create.ts";
+import { handleCreate, handleCreateStatus } from "../routes/create.ts";
 
 function setup() {
   cacheClear();

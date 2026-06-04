@@ -39,17 +39,17 @@ const html = `<!DOCTYPE html>
 </div>
 ${htmlBody}</body>
 </html>`;
-await Deno.writeTextFile("src/index.html", html);
-console.log("Generated src/index.html");
+await Deno.writeTextFile("deno/index.html", html);
+console.log("Generated deno/index.html");
 
 // 2. Compile to binary
 const cmd = new Deno.Command("deno", {
   args: [
     "compile",
-    "--include", "src/index.html",
+    "--include", "deno/index.html",
     "--allow-net", "--allow-read", "--allow-write", "--allow-env", "--allow-ffi",
     "--output", "dist/webauthnp256-publickey-index",
-    "index.ts",
+    "deno/index.ts",
   ],
   stdout: "inherit",
   stderr: "inherit",

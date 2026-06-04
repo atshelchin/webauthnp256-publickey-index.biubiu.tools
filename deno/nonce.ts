@@ -12,7 +12,7 @@
 import { createPublicClient, http } from "viem";
 import { gnosis } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
-import { getWriteRpc } from "./rpc.ts";
+import { getWriteRpc } from "../shared/rpc.ts";
 import { getConfig } from "./config.ts";
 
 interface NonceState {

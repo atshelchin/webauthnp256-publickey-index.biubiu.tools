@@ -7,11 +7,11 @@
  */
 
 import { assertEquals, assert } from "@std/assert/";
-import { initConfig, getConfig } from "./config.ts";
-import { initRpc } from "./rpc.ts";
-import { initQueue, getQueueItem, startQueueWorker, _setRateLimitForTest, type QueueStatus } from "./queue.ts";
-import { handleCreate } from "./routes/create.ts";
-import { cacheClear } from "./cache.ts";
+import { initConfig, getConfig } from "../config.ts";
+import { initRpc } from "../../shared/rpc.ts";
+import { initQueue, getQueueItem, startQueueWorker, _setRateLimitForTest, type QueueStatus } from "../queue.ts";
+import { handleCreate } from "../routes/create.ts";
+import { cacheClear } from "../../shared/cache.ts";
 
 // ── Helpers ──
 
@@ -28,7 +28,7 @@ async function generateP256PublicKeyHex(): Promise<string> {
   return Array.from(raw).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-import { getQueueDb } from "./queue.ts";
+import { getQueueDb } from "../queue.ts";
 
 function getQueueStats(): Record<string, number> {
   const db = getQueueDb();

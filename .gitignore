@@ -44,3 +44,7 @@ backups/
 # build generated
 src/index.html
 .VSCodeCounter
+
+# Cloudflare Workers
+.wrangler
+.dev.vars

@@ -1,5 +1,5 @@
 import { assertEquals, assert } from "@std/assert/";
-import { buildWalletRef } from "./wallet-ref.ts";
+import { buildWalletRef } from "../../shared/wallet-ref.ts";
 
 /** Generate a real P256 uncompressed public key (04 + x + y, 65 bytes = 130 hex chars). */
 async function generateP256PublicKeyHex(): Promise<string> {

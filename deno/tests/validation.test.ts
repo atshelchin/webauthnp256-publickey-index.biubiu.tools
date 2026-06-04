@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert/";
-import { validateStringLength } from "./validation.ts";
+import { validateStringLength } from "../../shared/validation.ts";
 
 Deno.test("validateStringLength passes valid inputs", () => {
   assertEquals(validateStringLength({

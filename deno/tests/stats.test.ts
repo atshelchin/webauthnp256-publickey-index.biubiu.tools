@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert/";
-import { cacheClear } from "../cache.ts";
-import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "./stats.ts";
+import { cacheClear } from "../../shared/cache.ts";
+import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../../shared/routes/stats.ts";
 
 function setup() {
   cacheClear();

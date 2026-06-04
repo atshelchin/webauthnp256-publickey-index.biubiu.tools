@@ -1,5 +1,5 @@
 import { assertEquals, assert } from "@std/assert/";
-import { cacheGet, cacheSet, cacheClear, cacheSize, cacheMemoryUsage, _configureForTest, _resetConfigForTest } from "./cache.ts";
+import { cacheGet, cacheSet, cacheClear, cacheSize, cacheMemoryUsage, _configureForTest, _resetConfigForTest } from "../../shared/cache.ts";
 
 function setup() {
   cacheClear();

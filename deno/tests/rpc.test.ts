@@ -1,5 +1,5 @@
 import { assertEquals, assertNotEquals } from "@std/assert/";
-import { getCurrentRpc, getWriteRpc, markFailed, _resetForTest } from "./rpc.ts";
+import { getCurrentRpc, getWriteRpc, markFailed, _resetForTest } from "../../shared/rpc.ts";
 
 const TEST_RPCS = ["https://rpc-a.test", "https://rpc-b.test", "https://rpc-c.test"];
 

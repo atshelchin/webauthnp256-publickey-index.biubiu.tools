@@ -1,9 +1,9 @@
-import { getPublicKey } from "../contract.ts";
+import { getPublicKey } from "../../shared/contract-read.ts";
 import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
-import { buildWalletRef } from "../wallet-ref.ts";
-import { cacheGet, cacheSet } from "../cache.ts";
-import { validateStringLength } from "../validation.ts";
+import { buildWalletRef } from "../../shared/wallet-ref.ts";
+import { cacheGet, cacheSet } from "../../shared/cache.ts";
+import { validateStringLength } from "../../shared/validation.ts";
 
 const MAX_BODY_SIZE = 32 * 1024; // 32KB
 

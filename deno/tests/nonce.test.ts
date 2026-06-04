@@ -1,5 +1,5 @@
 import { assert } from "@std/assert/";
-import { acquireNonce, resetNonce } from "./nonce.ts";
+import { acquireNonce, resetNonce } from "../nonce.ts";
 
 // --- resetNonce ---
 

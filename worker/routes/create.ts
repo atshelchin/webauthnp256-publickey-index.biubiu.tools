@@ -1,0 +1,131 @@
+import { getPublicKey } from "../../shared/contract-read.ts";
+import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
+import { encodeAbiParameters } from "viem";
+import { buildWalletRef } from "../../shared/wallet-ref.ts";
+import { cacheGet, cacheSet } from "../../shared/cache.ts";
+import { validateStringLength } from "../../shared/validation.ts";
+
+const MAX_BODY_SIZE = 32 * 1024;
+
+export async function handleCreate(req: Request, db: D1Database): Promise<Response> {
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+
+  let body: {
+    rpId?: string;
+    credentialId?: string;
+    walletRef?: string;
+    publicKey?: string;
+    name?: string;
+    initialCredentialId?: string;
+    metadata?: string;
+  };
+
+  try {
+    const text = await req.text();
+    if (text.length > MAX_BODY_SIZE) {
+      return Response.json({ error: "request body too large" }, { status: 413 });
+    }
+    body = JSON.parse(text);
+  } catch {
+    return Response.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+
+  const name = body.name;
+  const { rpId, credentialId, publicKey } = body;
+
+  if (!rpId || !credentialId || !publicKey || !name) {
+    return Response.json(
+      { error: "rpId, credentialId, publicKey, and name are required" },
+      { status: 400 },
+    );
+  }
+
+  const lengthError = validateStringLength({
+    rpId, credentialId, publicKey, name,
+    walletRef: body.walletRef,
+    initialCredentialId: body.initialCredentialId,
+    metadata: body.metadata,
+  });
+  if (lengthError) {
+    return Response.json({ error: lengthError }, { status: 400 });
+  }
+
+  // Rate limit by IP (CF provides cf-connecting-ip)
+  const ip = req.headers.get("cf-connecting-ip")
+    || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    || req.headers.get("x-real-ip")
+    || "unknown";
+  if (!await checkRateLimit(db, ip)) {
+    return Response.json({ error: "rate limit exceeded, max 5 requests per minute" }, { status: 429 });
+  }
+
+  const initialCredentialId = body.initialCredentialId || credentialId;
+  const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
+  const walletRef = body.walletRef || buildWalletRef(publicKey);
+  const metadata = body.metadata || encodeAbiParameters(
+    [{ type: "string" }, { type: "bytes" }],
+    ["VelaWalletV1", publicKeyHex],
+  );
+
+  // Already exists on-chain
+  const cacheKey = `query:${rpId}:${credentialId}`;
+  const cached = cacheGet<object>(cacheKey);
+  if (cached) {
+    return Response.json({ ...cached, status: "done" }, { status: 201 });
+  }
+  const existing = await getPublicKey(rpId, credentialId);
+  if (existing) {
+    cacheSet(cacheKey, existing);
+    return Response.json({ ...existing, status: "done" }, { status: 201 });
+  }
+
+  // Check if already in queue
+  const queued = await findDuplicate(db, rpId, credentialId);
+  if (queued && queued.status !== "failed") {
+    return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
+  }
+
+  // Enqueue
+  const id = await enqueue(db, { rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip });
+  return Response.json({ id, status: "pending" }, { status: 202 });
+}
+
+export async function handleCreateStatus(req: Request, db: D1Database): Promise<Response> {
+  const url = new URL(req.url);
+  const id = url.pathname.split("/").pop();
+  if (!id) {
+    return Response.json({ error: "id is required" }, { status: 400 });
+  }
+
+  const item = await getQueueItem(db, id);
+  if (!item) {
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  if (item.status === "done") {
+    return Response.json({
+      id: item.id,
+      status: item.status,
+      rpId: item.rpId,
+      credentialId: item.credentialId,
+      walletRef: item.walletRef,
+      publicKey: item.publicKey,
+      name: item.name,
+      txHash: item.txHash,
+      createdAt: item.createdAt,
+    });
+  }
+
+  return Response.json({
+    id: item.id,
+    status: item.status,
+    rpId: item.rpId,
+    publicKey: item.publicKey,
+    name: item.name,
+    error: item.error || undefined,
+    createdAt: item.createdAt,
+  });
+}

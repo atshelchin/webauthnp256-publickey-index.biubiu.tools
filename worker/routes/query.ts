@@ -1,11 +1,11 @@
-import { getPublicKey, getPublicKeyByWalletRef } from "../contract.ts";
-import { cacheGet, cacheSet } from "../cache.ts";
+import { getPublicKey, getPublicKeyByWalletRef } from "../../shared/contract-read.ts";
+import { cacheGet, cacheSet } from "../../shared/cache.ts";
 import { findDuplicate } from "../queue.ts";
-import { validateStringLength } from "../validation.ts";
+import { validateStringLength } from "../../shared/validation.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
-export async function handleQuery(req: Request): Promise<Response> {
+export async function handleQuery(req: Request, db: D1Database): Promise<Response> {
   const url = new URL(req.url);
   const rpId = url.searchParams.get("rpId");
   const credentialId = url.searchParams.get("credentialId");
@@ -16,7 +16,6 @@ export async function handleQuery(req: Request): Promise<Response> {
     return Response.json({ error: lengthError }, { status: 400 });
   }
 
-  // Query by walletRef
   if (walletRef) {
     const cacheKey = `query:walletRef:${walletRef}`;
     const cached = cacheGet<object>(cacheKey);
@@ -32,7 +31,6 @@ export async function handleQuery(req: Request): Promise<Response> {
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
-  // Query by rpId + credentialId (backward compatible)
   if (!rpId || !credentialId) {
     return Response.json({ error: "rpId and credentialId are required (or walletRef)" }, { status: 400 });
   }
@@ -43,18 +41,15 @@ export async function handleQuery(req: Request): Promise<Response> {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  // Try on-chain first
   const result = await getPublicKey(rpId, credentialId);
   if (result) {
     cacheSet(cacheKey, result);
     return Response.json(result, { headers: CACHE_HEADERS });
   }
 
-  // Fallback: check queue for pending/in-progress records
-  const queued = findDuplicate(rpId, credentialId);
+  // Fallback: check queue (D1, async)
+  const queued = await findDuplicate(db, rpId, credentialId);
   if (queued) {
-    // Redact credentialId/walletRef/initialCredentialId to prevent front-running
-    // Always return publicKey (client needs it)
     return Response.json({
       rpId: queued.rpId,
       publicKey: queued.publicKey,

@@ -1,13 +1,13 @@
-import { initConfig } from "./src/config.ts";
-import { initRpc, setAlchemyRpc } from "./src/rpc.ts";
-import { CONTRACT_ADDRESS } from "./src/contract.ts";
-import { handleQuery } from "./src/routes/query.ts";
-import { handleChallenge } from "./src/routes/challenge.ts";
-import { handleCreate, handleCreateStatus } from "./src/routes/create.ts";
-import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "./src/routes/stats.ts";
-import { initQueue, startQueueWorker } from "./src/queue.ts";
+import { initConfig } from "./config.ts";
+import { initRpc, setAlchemyRpc } from "../shared/rpc.ts";
+import { CONTRACT_ADDRESS } from "../shared/contract-read.ts";
+import { handleQuery } from "./routes/query.ts";
+import { handleChallenge } from "../shared/routes/challenge.ts";
+import { handleCreate, handleCreateStatus } from "./routes/create.ts";
+import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../shared/routes/stats.ts";
+import { initQueue, startQueueWorker } from "./queue.ts";
 
-const HOME_HTML = await Deno.readTextFile(new URL("./src/index.html", import.meta.url));
+const HOME_HTML = await Deno.readTextFile(new URL("./index.html", import.meta.url));
 
 const config = initConfig();
 if (config.alchemyApiKey) setAlchemyRpc(config.alchemyApiKey);

@@ -1,5 +1,5 @@
 import { assertEquals, assert } from "@std/assert/";
-import { initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit } from "./queue.ts";
+import { initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit } from "../queue.ts";
 
 function setup() {
   initQueue(":memory:");

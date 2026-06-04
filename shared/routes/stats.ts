@@ -1,4 +1,4 @@
-import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract.ts";
+import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract-read.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 import { validateStringLength } from "../validation.ts";
 

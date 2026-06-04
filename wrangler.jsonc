@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "webauthnp256-publickey-index",
+  "main": "worker/index.ts",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+  // D1 database — create with: wrangler d1 create webauthnp256-queue
+  // Then copy the database_id into wrangler.toml (gitignored) or use env-specific overrides
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "webauthnp256-queue",
+      "database_id": "" // Set in wrangler.toml or via env override
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "QUEUE_PROCESSOR",
+        "class_name": "QueueProcessor"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["QueueProcessor"]
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+  // Secrets (set via `wrangler secret put`):
+  // - PRIVATE_KEY
+  // - TELEGRAM_BOT_TOKEN
+  // - TELEGRAM_CHAT_ID
+  // - ALCHEMY_API_KEY
+}

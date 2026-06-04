@@ -1,13 +1,13 @@
 import { assertEquals, assert } from "@std/assert/";
-import { cacheClear } from "./cache.ts";
-import { initQueue } from "./queue.ts";
-import { handleQuery } from "./routes/query.ts";
-import { handleCreate } from "./routes/create.ts";
-import { handleListRpIds, handleListPublicKeys } from "./routes/stats.ts";
+import { cacheClear } from "../../shared/cache.ts";
+import { initQueue } from "../queue.ts";
+import { handleQuery } from "../routes/query.ts";
+import { handleCreate } from "../routes/create.ts";
+import { handleListRpIds, handleListPublicKeys } from "../../shared/routes/stats.ts";
 
 let HOME_HTML: string;
 try {
-  HOME_HTML = Deno.readTextFileSync(new URL("./index.html", import.meta.url));
+  HOME_HTML = Deno.readTextFileSync(new URL("../index.html", import.meta.url));
 } catch {
   HOME_HTML = "<!DOCTYPE html><html><body>test</body></html>";
 }

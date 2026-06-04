@@ -1,0 +1,191 @@
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { describe, it, expect, beforeAll } from "vitest";
+import worker from "../index.ts";
+import { initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit } from "../queue.ts";
+
+// Helpers
+function makeRequest(path: string, opts?: RequestInit) {
+  return new Request(`https://test.workers.dev${path}`, opts);
+}
+
+async function fetchWorker(path: string, opts?: RequestInit) {
+  const req = makeRequest(path, opts);
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(req, env, ctx);
+  await waitOnExecutionContext(ctx);
+  return res;
+}
+
+// --- API Route Tests ---
+
+describe("API routes", () => {
+  it("GET / returns HTML", async () => {
+    const res = await fetchWorker("/");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+  });
+
+  it("GET /api/health returns ok", async () => {
+    const res = await fetchWorker("/api/health");
+    const body = await res.json() as { status: string; runtime: string };
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("ok");
+    expect(body.runtime).toBe("cloudflare-workers");
+  });
+
+  it("GET /api/challenge returns base64url challenge", async () => {
+    const res = await fetchWorker("/api/challenge");
+    const body = await res.json() as { challenge: string };
+    expect(res.status).toBe(200);
+    expect(body.challenge).toBeDefined();
+    expect(body.challenge.length).toBeGreaterThan(0);
+    // base64url: no +, /, or =
+    expect(body.challenge).not.toMatch(/[+/=]/);
+  });
+
+  it("OPTIONS returns CORS headers", async () => {
+    const res = await fetchWorker("/", { method: "OPTIONS" });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+  });
+
+  it("unknown route returns 404", async () => {
+    const res = await fetchWorker("/api/nonexistent");
+    expect(res.status).toBe(404);
+  });
+
+  it("wrong HTTP method returns 404", async () => {
+    const res = await fetchWorker("/api/challenge", { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /api/query without params returns 400", async () => {
+    const res = await fetchWorker("/api/query");
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /api/stats/keys without rpId returns 400", async () => {
+    const res = await fetchWorker("/api/stats/keys");
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/create with missing fields returns 400", async () => {
+    const res = await fetchWorker("/api/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rpId: "test.com" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /api/create with invalid JSON returns 400", async () => {
+    const res = await fetchWorker("/api/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "not json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /api/create/:id with unknown id returns 404", async () => {
+    const res = await fetchWorker("/api/create/unknown-id-123");
+    expect(res.status).toBe(404);
+  });
+
+  it("CORS headers are present on all responses", async () => {
+    const res = await fetchWorker("/api/health");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+});
+
+// --- D1 Queue Tests ---
+
+describe("D1 Queue", () => {
+  beforeAll(async () => {
+    await initQueue(env.DB);
+  });
+
+  it("enqueue + getQueueItem round-trip", async () => {
+    const id = await enqueue(env.DB, {
+      rpId: "test.example.com",
+      credentialId: "cred-123",
+      walletRef: "0x" + "ab".repeat(32),
+      publicKey: "04" + "aa".repeat(64),
+      name: "Test Key",
+      initialCredentialId: "cred-123",
+      metadata: "0x1234",
+      ip: "127.0.0.1",
+    });
+
+    const item = await getQueueItem(env.DB, id);
+    expect(item).not.toBeNull();
+    expect(item!.rpId).toBe("test.example.com");
+    expect(item!.credentialId).toBe("cred-123");
+    expect(item!.status).toBe("pending");
+    expect(item!.name).toBe("Test Key");
+  });
+
+  it("getQueueItem returns null for unknown id", async () => {
+    const item = await getQueueItem(env.DB, "nonexistent-id");
+    expect(item).toBeNull();
+  });
+
+  it("findDuplicate finds existing item", async () => {
+    await enqueue(env.DB, {
+      rpId: "dup.example.com",
+      credentialId: "dup-cred",
+      walletRef: "0x" + "cc".repeat(32),
+      publicKey: "04" + "bb".repeat(64),
+      name: "Dup Key",
+      initialCredentialId: "dup-cred",
+      metadata: "0x5678",
+      ip: "192.168.1.1",
+    });
+
+    const dup = await findDuplicate(env.DB, "dup.example.com", "dup-cred");
+    expect(dup).not.toBeNull();
+    expect(dup!.rpId).toBe("dup.example.com");
+  });
+
+  it("findDuplicate returns null for unknown pair", async () => {
+    const dup = await findDuplicate(env.DB, "unknown.com", "unknown-cred");
+    expect(dup).toBeNull();
+  });
+
+  it("enqueue stores hashed IP, not raw", async () => {
+    const id = await enqueue(env.DB, {
+      rpId: "ip-test.com",
+      credentialId: "ip-cred",
+      walletRef: "0x" + "dd".repeat(32),
+      publicKey: "04" + "cc".repeat(64),
+      name: "IP Key",
+      initialCredentialId: "ip-cred",
+      metadata: "0x",
+      ip: "10.0.0.1",
+    });
+
+    const item = await getQueueItem(env.DB, id);
+    expect(item).not.toBeNull();
+    expect(item!.ip).not.toBe("10.0.0.1");
+    expect(item!.ip.length).toBe(16); // first 16 hex chars of SHA-256
+  });
+
+  it("checkRateLimit allows up to 5 requests", async () => {
+    const testIp = `rate-limit-${Date.now()}`;
+    for (let i = 0; i < 5; i++) {
+      expect(await checkRateLimit(env.DB, testIp)).toBe(true);
+    }
+    expect(await checkRateLimit(env.DB, testIp)).toBe(false);
+  });
+
+  it("checkRateLimit tracks different IPs independently", async () => {
+    const ip1 = `rl-ip1-${Date.now()}`;
+    const ip2 = `rl-ip2-${Date.now()}`;
+    for (let i = 0; i < 5; i++) {
+      await checkRateLimit(env.DB, ip1);
+    }
+    // ip1 exhausted, ip2 should still work
+    expect(await checkRateLimit(env.DB, ip2)).toBe(true);
+  });
+});

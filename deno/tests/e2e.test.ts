@@ -8,12 +8,12 @@
  */
 
 import { assertEquals, assert } from "@std/assert/";
-import { initConfig, getConfig } from "./config.ts";
-import { initRpc } from "./rpc.ts";
-import { initQueue, enqueue, getQueueItem, startQueueWorker, _setRateLimitForTest, type QueueStatus } from "./queue.ts";
-import { handleCreate, handleCreateStatus } from "./routes/create.ts";
-import { handleQuery } from "./routes/query.ts";
-import { cacheClear } from "./cache.ts";
+import { initConfig, getConfig } from "../config.ts";
+import { initRpc } from "../../shared/rpc.ts";
+import { initQueue, enqueue, getQueueItem, startQueueWorker, _setRateLimitForTest, type QueueStatus } from "../queue.ts";
+import { handleCreate, handleCreateStatus } from "../routes/create.ts";
+import { handleQuery } from "../routes/query.ts";
+import { cacheClear } from "../../shared/cache.ts";
 
 // ── Helpers ──
 
