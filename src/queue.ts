@@ -490,6 +490,9 @@ async function processPending() {
   }
 }
 
+const FAILURE_ALERT_BATCH = 10;
+let failuresSinceLastAlert = 0;
+
 function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | "committed" = "pending") {
   const retries = item.retries + 1;
   if (retries >= MAX_RETRIES) {
@@ -503,6 +506,13 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
     db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
       .run(retryStatus, error, retries, retryAfter, Date.now(), item.id);
     console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s, reset to ${retryStatus}): ${error}`);
+  }
+
+  failuresSinceLastAlert++;
+  if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
+    const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
+    sendTelegram(`🔴 [webauthnp256-publickey-index] ${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
+    failuresSinceLastAlert = 0;
   }
 }
 
