@@ -2,13 +2,20 @@
 
 WebAuthn P256 公钥索引服务。数据存储在 Gnosis 链上的智能合约 (V2) 中，本服务作为读写代理，提供 REST API。
 
-合约地址: `0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3` (Gnosis Chain)
+合约源码: [webauthnp256-publickey-index-contracts](https://github.com/atshelchin/webauthnp256-publickey-index-contracts)
+
+| 合约 | 地址 (Gnosis Chain) |
+|------|---------------------|
+| WebAuthnP256PublicKeyIndex | `0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3` |
+| WebAuthnP256BatchHelper | `0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E` |
 
 公共端点: `https://webauthnp256-publickey-index.biubiu.tools`
 
 - 运行时: Deno
 - 数据源: Gnosis 链上合约 (通过 viem 读写, RPC 轮询 + 自动故障转移)
-- 写入: 异步队列 (SQLite 暂存, 后台 commit-reveal 上链)
+- 写入: 异步队列 (SQLite 暂存, 后台批量 commit-reveal 上链)
+- 批量上链: 通过 BatchHelper 合约, 单笔 tx 处理多条 commit/createRecord
+- 双钱包: commit 和 createRecord 使用独立 EOA, nonce 互不干扰
 - 默认端口: 11256
 - CORS: 允许所有来源
 
