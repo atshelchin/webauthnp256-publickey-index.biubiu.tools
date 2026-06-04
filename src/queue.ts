@@ -416,34 +416,30 @@ async function processCommitted() {
   if (ready.length === 0) return;
   console.log(`[queue] Sending ${ready.length} createRecord txs...`);
 
-  // Acquire all nonces upfront, then fire all createRecord txs truly in parallel
-  const handles = await Promise.all(ready.map(() => acquireNonce("create")));
+  // Sequential send — each tx must succeed before next to prevent nonce gaps
   const { wallet } = getCreateWallet();
-  const txResults = await Promise.allSettled(
-    ready.map((item, i) => {
-      const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-      return wallet.writeContract({
+  let sent = 0;
+  for (const item of ready) {
+    const handle = await acquireNonce("create");
+    const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
+    try {
+      const hash = await wallet.writeContract({
         address: CONTRACT_ADDRESS,
         abi: writeAbi,
         functionName: "createRecord",
         args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
-        nonce: handles[i].nonce,
+        nonce: handle.nonce,
       });
-    })
-  );
-
-  for (let i = 0; i < ready.length; i++) {
-    const result = txResults[i];
-    if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
-        .run(result.value, Date.now(), ready[i].id);
-    } else {
-      // Mark creating anyway — tx may have reached mempool. processCreating verifies via hasRecord.
-      db.prepare("UPDATE create_queue SET status = 'creating', txHash = '', updatedAt = ? WHERE id = ?")
-        .run(Date.now(), ready[i].id);
-      console.warn(`[queue] Item ${ready[i].id} createRecord send uncertain: ${result.reason?.message ?? "unknown"}`);
+        .run(hash, Date.now(), item.id);
+      sent++;
+    } catch (err) {
+      handle.release();
+      console.warn(`[queue] CreateRecord failed at item ${sent + 1}/${ready.length}, stopping batch: ${err instanceof Error ? err.message : err}`);
+      break;
     }
   }
+  if (sent > 0) console.log(`[queue] ${sent}/${ready.length} createRecord txs sent`);
 }
 
 // Phase 3: Send commit txs for pending items (no waiting for receipt)
@@ -455,35 +451,30 @@ async function processPending() {
   if (items.length === 0) return;
   console.log(`[queue] Sending ${items.length} commit txs...`);
 
-  // Acquire all nonces upfront, then fire all commit txs truly in parallel
-  const handles = await Promise.all(items.map(() => acquireNonce("commit")));
+  // Sequential send — each tx must succeed before next to prevent nonce gaps
   const { wallet } = getCommitWallet();
-  const results = await Promise.allSettled(
-    items.map((item, i) => {
-      const { commitment } = buildCommitment(item);
-      return wallet.writeContract({
+  let sent = 0;
+  for (const item of items) {
+    const handle = await acquireNonce("commit");
+    const { commitment } = buildCommitment(item);
+    try {
+      await wallet.writeContract({
         address: CONTRACT_ADDRESS,
         abi: writeAbi,
         functionName: "commit",
         args: [commitment],
-        nonce: handles[i].nonce,
+        nonce: handle.nonce,
       });
-    })
-  );
-
-  for (let i = 0; i < items.length; i++) {
-    const result = results[i];
-    if (result.status === "fulfilled") {
-      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
-    } else {
-      // Mark committed anyway — the tx may have reached the mempool despite the error.
-      // processCommitted will verify via getCommitBlock(); if not on-chain after cooldown, it resets to pending.
-      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
-      console.warn(`[queue] Item ${items[i].id} commit send uncertain: ${result.reason?.message ?? "unknown"}`);
+      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+      sent++;
+    } catch (err) {
+      // Release nonce and stop batch — don't create gaps
+      handle.release();
+      console.warn(`[queue] Commit failed at item ${sent + 1}/${items.length}, stopping batch: ${err instanceof Error ? err.message : err}`);
+      break;
     }
   }
-  // Never resetNonce here — nonces are consumed even if RPC response timed out.
-  // Gap nonces will resolve when pending txs are mined or dropped from mempool.
+  if (sent > 0) console.log(`[queue] ${sent}/${items.length} commit txs sent`);
 }
 
 const FAILURE_ALERT_BATCH = 10;
