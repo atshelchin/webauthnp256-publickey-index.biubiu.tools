@@ -58,3 +58,27 @@ Deno.test("validateStringLength accepts values at exact limit", () => {
   assertEquals(validateStringLength({ rpId: "a".repeat(253) }), null);
   assertEquals(validateStringLength({ name: "n".repeat(256) }), null);
 });
+
+Deno.test("validateStringLength rejects non-hex publicKey", () => {
+  const result = validateStringLength({ publicKey: "04" + "zz".repeat(64) });
+  assertEquals(typeof result, "string");
+  assertEquals(result!.includes("hex"), true);
+});
+
+Deno.test("validateStringLength rejects non-hex walletRef", () => {
+  const result = validateStringLength({ walletRef: "0xNOTHEX" });
+  assertEquals(typeof result, "string");
+  assertEquals(result!.includes("hex"), true);
+});
+
+Deno.test("validateStringLength rejects non-hex metadata", () => {
+  const result = validateStringLength({ metadata: "not-hex-at-all!" });
+  assertEquals(typeof result, "string");
+  assertEquals(result!.includes("hex"), true);
+});
+
+Deno.test("validateStringLength accepts valid hex with 0x prefix", () => {
+  assertEquals(validateStringLength({ publicKey: "04" + "ab".repeat(64) }), null);
+  assertEquals(validateStringLength({ walletRef: "0x" + "ff".repeat(32) }), null);
+  assertEquals(validateStringLength({ metadata: "0x" + "00".repeat(10) }), null);
+});

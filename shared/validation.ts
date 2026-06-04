@@ -14,6 +14,10 @@ const LIMITS = {
   metadata: 4096,       // abi-encoded metadata
 } as const;
 
+// Fields that must be valid hex strings (with or without 0x prefix)
+const HEX_FIELDS = new Set<string>(["publicKey", "walletRef", "metadata"]);
+const HEX_RE = /^(0x)?[0-9a-fA-F]*$/;
+
 export type FieldName = keyof typeof LIMITS;
 
 export function validateStringLength(
@@ -24,6 +28,9 @@ export function validateStringLength(
     const limit = LIMITS[name as FieldName];
     if (limit && value.length > limit) {
       return `${name} exceeds max length (${limit})`;
+    }
+    if (HEX_FIELDS.has(name) && !HEX_RE.test(value)) {
+      return `${name} must be a valid hex string`;
     }
   }
   return null;

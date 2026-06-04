@@ -71,6 +71,7 @@ export function initQueue(dbPath = "queue.db") {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(CREATE_QUEUE_DDL);
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)");
 
   // Migrations for existing databases
   const columns = db.prepare("PRAGMA table_info(create_queue)").all() as unknown as { name: string }[];

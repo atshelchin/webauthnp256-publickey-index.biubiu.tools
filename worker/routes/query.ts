@@ -17,6 +17,10 @@ export async function handleQuery(req: Request, db: D1Database): Promise<Respons
   }
 
   if (walletRef) {
+    if (!walletRef.startsWith("0x") || walletRef.length !== 66) {
+      return Response.json({ error: "walletRef must be a 0x-prefixed 32-byte hex string" }, { status: 400 });
+    }
+
     const cacheKey = `query:walletRef:${walletRef}`;
     const cached = cacheGet<object>(cacheKey);
     if (cached) {

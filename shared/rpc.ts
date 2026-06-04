@@ -132,10 +132,12 @@ export async function initRpc(): Promise<void> {
   }
   lastRefresh = Date.now();
 
-  // Periodic refresh
-  setInterval(() => {
-    refreshIfNeeded().catch(() => {});
-  }, REFRESH_INTERVAL);
+  // Periodic refresh (only in long-lived runtimes like Deno, not CF Workers)
+  if (typeof Deno !== "undefined") {
+    setInterval(() => {
+      refreshIfNeeded().catch(() => {});
+    }, REFRESH_INTERVAL);
+  }
 }
 
 /**
