@@ -251,13 +251,15 @@ export class QueueProcessor implements DurableObject {
           gas: gasEstimate * 120n / 100n,
         });
 
+        // Wait for receipt before marking done (CF DO has 30s CPU limit, this is fine)
+        await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
         const now = Date.now();
         const stmts = batch.map((item) =>
-          this.db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
+          this.db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
             .bind(hash, now, item.id)
         );
         await this.db.batch(stmts);
-        console.log(`[queue-processor] batchCreateRecord: ${batch.length} items, tx: ${hash}`);
+        console.log(`[queue-processor] batchCreateRecord: ${batch.length} items confirmed, done`);
       } catch (err) {
         handle.release();
         const msg = err instanceof Error ? err.message : String(err);
