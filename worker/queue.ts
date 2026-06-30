@@ -11,6 +11,8 @@ import {
   CREATE_QUEUE_DDL,
   CREATE_ACTIVE_UNIQUE_INDEX,
   DEDUPE_ACTIVE_DUPLICATES_SQL,
+  GLOBAL_WRITE_WINDOW,
+  DEFAULT_GLOBAL_WRITE_LIMIT,
   isUniqueConstraintError,
   hashIp,
 } from "../shared/queue.ts";
@@ -60,6 +62,7 @@ export async function initQueue(db: D1Database): Promise<void> {
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_created ON create_queue(createdAt)"), // global write-rate cap
     // Idempotency: dedupe any pre-existing active duplicates (ordered before the
     // unique index so it can build on a DB that already contains duplicates),
     // then enforce at-most-one-active-row per (rpId, credentialId).
@@ -151,6 +154,15 @@ export async function getActiveQueueDepth(db: D1Database): Promise<number> {
     db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").first<{ c: number }>()
   );
   return r?.c ?? 0;
+}
+
+/** True when the GLOBAL create rate (across all clients) is at the cap — bounds gas burn. */
+export async function globalWriteLimitExceeded(db: D1Database): Promise<boolean> {
+  const since = Date.now() - GLOBAL_WRITE_WINDOW;
+  const r = await withD1Retry(() =>
+    db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE createdAt > ?").bind(since).first<{ c: number }>()
+  );
+  return (r?.c ?? 0) >= DEFAULT_GLOBAL_WRITE_LIMIT;
 }
 
 /** Queue health snapshot for /api/health. */

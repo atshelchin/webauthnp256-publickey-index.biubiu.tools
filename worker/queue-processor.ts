@@ -23,6 +23,7 @@ import {
   FUND_THRESHOLD,
   FUND_AMOUNT,
   DONE_RETENTION,
+  FAILED_RETENTION,
   CREATE_SUB_BATCH,
   buildCommitment,
   getCreateWallet,
@@ -183,7 +184,11 @@ export class QueueProcessor implements DurableObject {
     const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
     const currentBlock = await client.getBlockNumber();
 
-    const commitments = items.map((item) => buildCommitment(item).commitment);
+    // Guard commitment building per item — a poison row is quarantined, not
+    // allowed to crash the cycle before the try block (was a queue-wide DoS).
+    const { valid, commitments } = await this.buildCommitmentsSafe(items, "committed");
+    if (commitments.length === 0) return;
+
     const calls = commitments.map((commitment) => ({
       address: CONTRACT_ADDRESS as `0x${string}`,
       abi: CONTRACT_ABI,
@@ -202,14 +207,14 @@ export class QueueProcessor implements DurableObject {
     const ready: QueueItem[] = [];
     const needsHasRecordCheck: QueueItem[] = [];
 
-    for (let i = 0; i < items.length; i++) {
+    for (let i = 0; i < valid.length; i++) {
       const result = results[i];
       if (result.status !== "success") continue;
       const commitBlock = result.result as bigint;
       if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
-        ready.push(items[i]);
+        ready.push(valid[i]);
       } else if (commitBlock === 0n) {
-        needsHasRecordCheck.push(items[i]);
+        needsHasRecordCheck.push(valid[i]);
       }
     }
 
@@ -431,7 +436,9 @@ export class QueueProcessor implements DurableObject {
 
     if (items.length === 0) return;
 
-    const commitments = items.map((item) => buildCommitment(item).commitment);
+    // Guard commitment building per item — quarantine poison rows, never crash.
+    const { valid: items2, commitments } = await this.buildCommitmentsSafe(items, "pending");
+    if (commitments.length === 0) return;
 
     const { wallet, client: commitClient } = getCommitWallet(config);
     const handle = await acquireNonce("commit", config);
@@ -459,29 +466,54 @@ export class QueueProcessor implements DurableObject {
       }
 
       const now = Date.now();
-      const stmts = items.map((item) =>
+      const stmts = items2.map((item) =>
         this.db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?")
           .bind(now, item.id)
       );
       await this.db.batch(stmts);
-      log.info("batchCommit confirmed", { operation: "batchCommit", count: items.length, outcome: "success" });
+      log.info("batchCommit confirmed", { operation: "batchCommit", count: items2.length, outcome: "success" });
     } catch (err) {
       handle.release();
       const msg = shortMsg(err);
       if (batchFailureAction(err) === "retry-transient") {
-        for (const item of items) await this.handleFailure(item, `batchCommit: ${msg}`, "pending");
-        log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items.length, error_category: "transient" });
+        for (const item of items2) await this.handleFailure(item, `batchCommit: ${msg}`, "pending");
+        log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items2.length, error_category: "transient" });
       } else {
-        log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items.length, error_category: "poison" });
-        await this.isolatePoisonCommit(commitClient, wallet, items);
+        log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items2.length, error_category: "poison" });
+        await this.isolatePoisonCommit(commitClient, wallet, items2);
       }
     }
   }
 
+  /**
+   * Build commitments for a batch, quarantining any row whose stored fields
+   * can't be ABI-encoded (poison). MUST be used instead of items.map(build...)
+   * so one bad row goes to the DLQ instead of crashing the whole worker cycle.
+   */
+  private async buildCommitmentsSafe(
+    items: QueueItem[],
+    retryStatus: "pending" | "committed",
+  ): Promise<{ valid: QueueItem[]; commitments: `0x${string}`[] }> {
+    const valid: QueueItem[] = [];
+    const commitments: `0x${string}`[] = [];
+    for (const item of items) {
+      try {
+        commitments.push(buildCommitment(item).commitment);
+        valid.push(item);
+      } catch (err) {
+        await this.handleFailure(item, `uncommittable (bad encoding): ${shortMsg(err)}`, retryStatus, { poison: true });
+      }
+    }
+    return { valid, commitments };
+  }
+
   private async cleanupDoneRecords(): Promise<void> {
-    const cutoff = Date.now() - DONE_RETENTION;
+    const now = Date.now();
+    // Bound the DLQ ('failed') alongside 'done' cleanup so neither grows forever.
+    await this.db.prepare("DELETE FROM create_queue WHERE status = 'failed' AND updatedAt < ?")
+      .bind(now - FAILED_RETENTION).run();
     const result = await this.db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?")
-      .bind(cutoff).run();
+      .bind(now - DONE_RETENTION).run();
     if (result.meta.changes && result.meta.changes > 0) {
       console.log(`[queue-processor] Cleaned up ${result.meta.changes} done records`);
     }

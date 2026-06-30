@@ -20,10 +20,13 @@ import {
   FUND_THRESHOLD,
   FUND_AMOUNT,
   DONE_RETENTION,
+  FAILED_RETENTION,
   CREATE_SUB_BATCH,
   CREATE_QUEUE_DDL,
   CREATE_ACTIVE_UNIQUE_INDEX,
   DEDUPE_ACTIVE_DUPLICATES_SQL,
+  GLOBAL_WRITE_WINDOW,
+  DEFAULT_GLOBAL_WRITE_LIMIT,
   isUniqueConstraintError,
   splitByHasRecord,
   batchFailureAction,
@@ -81,6 +84,7 @@ export function initQueue(dbPath = "queue.db") {
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_created ON create_queue(createdAt)"); // global write-rate cap
 
   // Migrations for existing databases
   const columns = db.prepare("PRAGMA table_info(create_queue)").all() as unknown as { name: string }[];
@@ -144,6 +148,19 @@ export function getActiveQueueDepth(): number {
   return (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").get() as unknown as { c: number }).c;
 }
 
+let GLOBAL_WRITE_LIMIT = DEFAULT_GLOBAL_WRITE_LIMIT;
+/** Override the global write cap (for testing only). */
+export function _setGlobalWriteLimitForTest(limit: number): void {
+  GLOBAL_WRITE_LIMIT = limit;
+}
+
+/** True when the GLOBAL create rate (across all clients) is at the cap — bounds gas burn. */
+export function globalWriteLimitExceeded(): boolean {
+  const since = Date.now() - GLOBAL_WRITE_WINDOW;
+  const n = (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE createdAt > ?").get(since) as unknown as { c: number }).c;
+  return n >= GLOBAL_WRITE_LIMIT;
+}
+
 /** Queue health snapshot for /api/health (3 fields). */
 export function getQueueStats(): QueueStats {
   const depth = (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").get() as unknown as { c: number }).c;
@@ -168,10 +185,12 @@ let lastAlertAt = 0;
 let lastFailedCount = 0;
 
 function cleanupDoneRecords(): void {
-  const cutoff = Date.now() - DONE_RETENTION;
-  const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(cutoff);
+  const now = Date.now();
+  const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(now - DONE_RETENTION);
   const deleted = (result as unknown as { changes: number }).changes;
   if (deleted > 0) console.log(`[queue] Cleaned up ${deleted} done records older than 7 days`);
+  // Bound the DLQ: drop 'failed' rows past the retention window.
+  db.prepare("DELETE FROM create_queue WHERE status = 'failed' AND updatedAt < ?").run(now - FAILED_RETENTION);
 }
 
 function cfg(): AppConfig {
@@ -384,7 +403,12 @@ async function processCommitted() {
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
   const currentBlock = await client.getBlockNumber();
 
-  const commitments = items.map((item) => buildCommitment(item).commitment);
+  // Build commitments, quarantining any row whose stored fields can't be ABI-
+  // encoded (poison). buildCommitment MUST be guarded per item — a single throw
+  // here previously crashed the whole cycle before the try block (queue DoS).
+  const { valid, commitments } = buildCommitmentsSafe(items, "committed");
+  if (commitments.length === 0) return;
+
   const calls = commitments.map((commitment) => ({
     address: CONTRACT_ADDRESS as `0x${string}`,
     abi: CONTRACT_ABI,
@@ -403,14 +427,14 @@ async function processCommitted() {
   const ready: QueueItem[] = [];
   const needsHasRecordCheck: QueueItem[] = [];
 
-  for (let i = 0; i < items.length; i++) {
+  for (let i = 0; i < valid.length; i++) {
     const result = results[i];
     if (result.status !== "success") continue;
     const commitBlock = result.result as bigint;
     if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
-      ready.push(items[i]);
+      ready.push(valid[i]);
     } else if (commitBlock === 0n) {
-      needsHasRecordCheck.push(items[i]);
+      needsHasRecordCheck.push(valid[i]);
     }
   }
 
@@ -624,7 +648,10 @@ async function processPending() {
 
   if (items.length === 0) return;
 
-  const commitments = items.map((item) => buildCommitment(item).commitment);
+  // Guard commitment building per item — a poison row must be quarantined, not
+  // crash the cycle before the try block (was a queue-wide DoS).
+  const { valid: items2, commitments } = buildCommitmentsSafe(items, "pending");
+  if (commitments.length === 0) return;
 
   const { wallet, client: commitClient } = getCommitWallet(cfg());
   const handle = await acquireNonce("commit");
@@ -650,19 +677,19 @@ async function processPending() {
       throw new Error(`batchCommit tx reverted: ${hash}`);
     }
     const now = Date.now();
-    for (const item of items) {
+    for (const item of items2) {
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
     }
-    log.info("batchCommit confirmed", { operation: "batchCommit", count: items.length, outcome: "success" });
+    log.info("batchCommit confirmed", { operation: "batchCommit", count: items2.length, outcome: "success" });
   } catch (err) {
     handle.release();
     const msg = shortMsg(err);
     if (batchFailureAction(err) === "retry-transient") {
-      for (const item of items) handleFailure(item, `batchCommit: ${msg}`, "pending");
-      log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items.length, error_category: "transient" });
+      for (const item of items2) handleFailure(item, `batchCommit: ${msg}`, "pending");
+      log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items2.length, error_category: "transient" });
     } else {
-      log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items.length, error_category: "poison" });
-      await isolatePoisonCommit(commitClient, wallet, items);
+      log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items2.length, error_category: "poison" });
+      await isolatePoisonCommit(commitClient, wallet, items2);
     }
   }
 }
@@ -746,6 +773,30 @@ function shortMsg(err: unknown): string {
   // Redact any embedded RPC credentials before this string is stored in the
   // queue 'error' column (surfaced to operators / the status endpoint) or logged.
   return redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
+}
+
+/**
+ * Build commitments for a batch, quarantining any row whose stored fields can't
+ * be ABI-encoded (e.g. a malformed walletRef/publicKey/metadata that slipped in
+ * before validation was tightened). MUST be used instead of items.map(build...)
+ * so one poison row is sent to the DLQ rather than throwing and aborting the
+ * whole worker cycle (which was a queue-wide DoS).
+ */
+function buildCommitmentsSafe(
+  items: QueueItem[],
+  retryStatus: "pending" | "committed",
+): { valid: QueueItem[]; commitments: `0x${string}`[] } {
+  const valid: QueueItem[] = [];
+  const commitments: `0x${string}`[] = [];
+  for (const item of items) {
+    try {
+      commitments.push(buildCommitment(item).commitment);
+      valid.push(item);
+    } catch (err) {
+      handleFailure(item, `uncommittable (bad encoding): ${shortMsg(err)}`, retryStatus, { poison: true });
+    }
+  }
+  return { valid, commitments };
 }
 
 function markItemDone(item: QueueItem, txHash = ""): void {

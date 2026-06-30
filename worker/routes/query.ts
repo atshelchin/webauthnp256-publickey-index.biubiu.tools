@@ -1,5 +1,5 @@
 import { getPublicKey, getPublicKeyByWalletRef } from "../../shared/contract-read.ts";
-import { cacheGet, cacheGetStale, cacheSet } from "../../shared/cache.ts";
+import { cacheGet, cacheGetStale, cacheSet, cacheKey as cacheKey_ } from "../../shared/cache.ts";
 import { findDuplicate } from "../queue.ts";
 import { validateStringLength } from "../../shared/validation.ts";
 import { isDependencyError, serveStaleOrDependency, STALE_MAX_MS_RECORD } from "../../shared/routes/errors.ts";
@@ -22,7 +22,7 @@ export async function handleQuery(req: Request, db: D1Database): Promise<Respons
       return Response.json({ error: "walletRef must be a 0x-prefixed 32-byte hex string" }, { status: 400 });
     }
 
-    const cacheKey = `query:walletRef:${walletRef}`;
+    const cacheKey = cacheKey_("query", "walletRef", walletRef);
     const cached = cacheGet<object>(cacheKey);
     if (cached) {
       return Response.json(cached, { headers: CACHE_HEADERS });
@@ -48,7 +48,7 @@ export async function handleQuery(req: Request, db: D1Database): Promise<Respons
     return Response.json({ error: "rpId and credentialId are required (or walletRef)" }, { status: 400 });
   }
 
-  const cacheKey = `query:${rpId}:${credentialId}`;
+  const cacheKey = cacheKey_("query", rpId, credentialId);
   const cached = cacheGet<object>(cacheKey);
   if (cached) {
     return Response.json(cached, { headers: CACHE_HEADERS });

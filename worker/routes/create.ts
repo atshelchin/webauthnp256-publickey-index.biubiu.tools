@@ -1,8 +1,8 @@
 import { getPublicKey } from "../../shared/contract-read.ts";
-import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth } from "../queue.ts";
+import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
-import { cacheGet, cacheSet } from "../../shared/cache.ts";
+import { cacheGet, cacheSet, cacheKey as cacheKey_ } from "../../shared/cache.ts";
 import { validateStringLength } from "../../shared/validation.ts";
 import { isDependencyError } from "../../shared/routes/errors.ts";
 import { MAX_ACTIVE_QUEUE_DEPTH } from "../../shared/routes/health.ts";
@@ -68,14 +68,19 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
 
   const initialCredentialId = body.initialCredentialId || credentialId;
   const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
-  const walletRef = body.walletRef || buildWalletRef(publicKey);
+  // walletRef is BOUND to the publicKey (must be the derived Safe address) — a
+  // client can never claim an arbitrary/victim address (identity forgery).
+  const walletRef = buildWalletRef(publicKey);
+  if (body.walletRef && body.walletRef.toLowerCase() !== walletRef.toLowerCase()) {
+    return Response.json({ error: "walletRef does not match publicKey" }, { status: 400 });
+  }
   const metadata = body.metadata || encodeAbiParameters(
     [{ type: "string" }, { type: "bytes" }],
     ["VelaWalletV1", publicKeyHex],
   );
 
   // Already exists on-chain
-  const cacheKey = `query:${rpId}:${credentialId}`;
+  const cacheKey = cacheKey_("query", rpId, credentialId);
   const cached = cacheGet<object>(cacheKey);
   if (cached) {
     return Response.json({ ...cached, status: "done" }, { status: 201 });
@@ -105,9 +110,10 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
 
   // Backpressure: shed genuinely-new work when the active queue is dangerously
   // deep. Fail-open on a stats hiccup (never block a create on a counting error).
+  // Backpressure + global write cap (bounds gas spend even if per-IP is evaded).
   try {
-    if (await getActiveQueueDepth(db) >= MAX_ACTIVE_QUEUE_DEPTH) {
-      log.warn("create shed: queue backpressure", { operation: "create", outcome: "shed" });
+    if (await getActiveQueueDepth(db) >= MAX_ACTIVE_QUEUE_DEPTH || await globalWriteLimitExceeded(db)) {
+      log.warn("create shed: backpressure / global write cap", { operation: "create", outcome: "shed" });
       return Response.json(
         { error: "service busy, please retry shortly", retryable: true },
         { status: 503, headers: { "Retry-After": "30" } },

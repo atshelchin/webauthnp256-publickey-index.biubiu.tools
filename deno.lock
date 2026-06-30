@@ -1184,7 +1184,10 @@
         "npm:viem@2",
         "npm:vitest@2.1",
         "npm:wrangler@^3.100.0"
-      ]
+      ],
+      "overrides": {
+        "ws": "^8.21.0"
+      }
     }
   }
 }

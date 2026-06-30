@@ -11,6 +11,7 @@ import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from ".
 import { handleQuery } from "./routes/query.ts";
 import { handleCreate, handleCreateStatus } from "./routes/create.ts";
 import { initQueue, getQueueStats } from "./queue.ts";
+import { setIpHashSalt } from "../shared/queue.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
 import { log, newRequestId } from "../shared/log.ts";
 import type { Env } from "./types.ts";
@@ -43,6 +44,9 @@ export default {
     // Initialize RPC list (lazy, once per isolate lifetime)
     if (!rpcInitialized) {
       await initRpc();
+      // Salt IP hashing with a server secret so stored hashes can't be brute-
+      // forced back to raw IPs if D1 leaks.
+      setIpHashSalt(env.PRIVATE_KEY || "webauthnp256-index");
       rpcInitialized = true;
     }
 

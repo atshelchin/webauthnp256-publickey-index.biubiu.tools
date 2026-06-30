@@ -78,6 +78,17 @@ export function cacheSet<T>(key: string, value: T): void {
   }
 }
 
+/**
+ * Build a collision-safe cache key. User-controlled parts are percent-escaped so
+ * a ':' inside a value cannot merge into the delimiter and ALIAS another key —
+ * e.g. (rpId="x", credentialId="a:b") and (rpId="x:a", credentialId="b") would
+ * otherwise both produce "query:x:a:b" and serve each other's record (a targeted
+ * key-substitution). encodeURIComponent escapes ':' (→ %3A), removing the alias.
+ */
+export function cacheKey(...parts: (string | number)[]): string {
+  return parts.map((p) => encodeURIComponent(String(p))).join(":");
+}
+
 export function cacheClear(): void {
   store.clear();
   totalSize = 0;

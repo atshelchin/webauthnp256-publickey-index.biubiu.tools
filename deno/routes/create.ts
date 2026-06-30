@@ -1,8 +1,8 @@
 import { getPublicKey } from "../../shared/contract-read.ts";
-import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth } from "../queue.ts";
+import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
-import { cacheGet, cacheSet } from "../../shared/cache.ts";
+import { cacheGet, cacheSet, cacheKey as cacheKey_ } from "../../shared/cache.ts";
 import { validateStringLength } from "../../shared/validation.ts";
 import { isDependencyError } from "../../shared/routes/errors.ts";
 import { MAX_ACTIVE_QUEUE_DEPTH } from "../../shared/routes/health.ts";
@@ -58,8 +58,12 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ error: lengthError }, { status: 400 });
   }
 
-  // Rate limit by IP (hashed for GDPR)
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+  // Rate limit by IP (hashed for GDPR). Prefer cf-connecting-ip (set by
+  // Cloudflare, not client-spoofable) when fronted by CF; x-forwarded-for[0] is
+  // client-controlled and only a best-effort fairness signal. The global write
+  // cap below is the real, spoof-proof bound on gas spend.
+  const ip = req.headers.get("cf-connecting-ip")
+    || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
     || req.headers.get("x-real-ip")
     || "unknown";
   if (!await checkRateLimit(ip)) {
@@ -68,15 +72,21 @@ export async function handleCreate(req: Request): Promise<Response> {
 
   const initialCredentialId = body.initialCredentialId || credentialId;
   const publicKeyHex = (publicKey.startsWith("0x") ? publicKey : `0x${publicKey}`) as `0x${string}`;
-  // walletRef: optional, default to Safe address derived from publicKey
-  const walletRef = body.walletRef || buildWalletRef(publicKey);
+  // walletRef is BOUND to the publicKey: it must be the deterministically-derived
+  // Safe address. A client may omit it (we derive) or send it (must match) — it
+  // can never claim an arbitrary/victim address (identity forgery / squatting),
+  // since query-by-walletRef returns this record's publicKey.
+  const walletRef = buildWalletRef(publicKey);
+  if (body.walletRef && body.walletRef.toLowerCase() !== walletRef.toLowerCase()) {
+    return Response.json({ error: "walletRef does not match publicKey" }, { status: 400 });
+  }
   const metadata = body.metadata || encodeAbiParameters(
     [{ type: "string" }, { type: "bytes" }],
     ["VelaWalletV1", publicKeyHex],
   );
 
   // Already exists on-chain — return success (idempotent)
-  const cacheKey = `query:${rpId}:${credentialId}`;
+  const cacheKey = cacheKey_("query", rpId, credentialId);
   const cached = cacheGet<object>(cacheKey);
   if (cached) {
     return Response.json({ ...cached, status: "done" }, { status: 201 });
@@ -105,12 +115,13 @@ export async function handleCreate(req: Request): Promise<Response> {
     return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
   }
 
-  // Backpressure: shed genuinely-new work when the active queue is dangerously
-  // deep so a burst cannot grow the queue/DB unbounded. Fail-open on a stats
-  // hiccup (never block a create on a counting error).
+  // Backpressure + global write cap: shed genuinely-new work when the active
+  // queue is dangerously deep OR the global create rate (across ALL clients) is
+  // at the cap. The latter bounds worst-case gas spend even if the per-IP limit
+  // is evaded. Fail-open on a stats hiccup (never block a create on a count error).
   try {
-    if (getActiveQueueDepth() >= MAX_ACTIVE_QUEUE_DEPTH) {
-      log.warn("create shed: queue backpressure", { operation: "create", outcome: "shed" });
+    if (getActiveQueueDepth() >= MAX_ACTIVE_QUEUE_DEPTH || globalWriteLimitExceeded()) {
+      log.warn("create shed: backpressure / global write cap", { operation: "create", outcome: "shed" });
       return Response.json(
         { error: "service busy, please retry shortly", retryable: true },
         { status: 503, headers: { "Retry-After": "30" } },

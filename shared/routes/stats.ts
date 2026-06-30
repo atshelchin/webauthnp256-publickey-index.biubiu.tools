@@ -1,5 +1,5 @@
 import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract-read.ts";
-import { cacheGet, cacheGetStale, cacheSet } from "../cache.ts";
+import { cacheGet, cacheGetStale, cacheSet, cacheKey as cacheKey_ } from "../cache.ts";
 import { validateStringLength } from "../validation.ts";
 import { isDependencyError, serveStaleOrDependency, STALE_MAX_MS_STATS } from "./errors.ts";
 
@@ -21,7 +21,7 @@ export async function handleListRpIds(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const { page, pageSize, order } = parsePagination(url);
 
-  const cacheKey = `stats:rpIds:${page}:${pageSize}:${order}`;
+  const cacheKey = cacheKey_("stats", "rpIds", page, pageSize, order);
   const cached = cacheGet<object>(cacheKey);
   if (cached) {
     return Response.json(cached, { headers: CACHE_HEADERS });
@@ -71,7 +71,7 @@ export async function handleListPublicKeys(req: Request): Promise<Response> {
 
   const { page, pageSize, order } = parsePagination(url);
 
-  const cacheKey = `stats:keys:${rpId}:${page}:${pageSize}:${order}`;
+  const cacheKey = cacheKey_("stats", "keys", rpId, page, pageSize, order);
   const cached = cacheGet<object>(cacheKey);
   if (cached) {
     return Response.json(cached, { headers: CACHE_HEADERS });

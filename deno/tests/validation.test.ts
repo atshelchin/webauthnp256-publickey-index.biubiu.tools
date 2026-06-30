@@ -82,3 +82,33 @@ Deno.test("validateStringLength accepts valid hex with 0x prefix", () => {
   assertEquals(validateStringLength({ walletRef: "0x" + "ff".repeat(32) }), null);
   assertEquals(validateStringLength({ metadata: "0x" + "00".repeat(10) }), null);
 });
+
+// --- Security: reject out-of-spec hex that would crash the ABI encoder in the
+// background worker (was a queue-wide DoS via a single POST /api/create). ---
+
+Deno.test("validateStringLength rejects a non-32-byte walletRef (queue-poison guard)", () => {
+  for (const bad of ["0xdead", "0x" + "ff".repeat(31), "ff".repeat(33), "0x"]) {
+    const r = validateStringLength({ walletRef: bad });
+    assertEquals(typeof r, "string", `should reject walletRef ${bad}`);
+    assertEquals(r!.includes("walletRef"), true);
+  }
+  // exactly 32 bytes still accepted
+  assertEquals(validateStringLength({ walletRef: "0x" + "ab".repeat(32) }), null);
+  assertEquals(validateStringLength({ walletRef: "ab".repeat(32) }), null);
+});
+
+Deno.test("validateStringLength rejects a non-P256 / odd-length publicKey", () => {
+  // odd-length / wrong-prefix / short keys would break encode or buildWalletRef
+  for (const bad of ["04abc", "00" + "aa".repeat(64), "04" + "a".repeat(127)]) {
+    const r = validateStringLength({ publicKey: bad });
+    assertEquals(typeof r, "string", `should reject publicKey ${bad}`);
+  }
+  assertEquals(validateStringLength({ publicKey: "04" + "aa".repeat(64) }), null);
+});
+
+Deno.test("validateStringLength rejects odd-length (non-byte-aligned) metadata", () => {
+  const r = validateStringLength({ metadata: "0xabc" });
+  assertEquals(typeof r, "string");
+  assertEquals(r!.includes("metadata"), true);
+  assertEquals(validateStringLength({ metadata: "0xabcd" }), null);
+});

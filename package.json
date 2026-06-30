@@ -10,6 +10,9 @@
   "dependencies": {
     "viem": "^2.0.0"
   },
+  "overrides": {
+    "ws": "^8.21.0"
+  },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.41",
     "@cloudflare/workers-types": "^4.20241205.0",

@@ -85,6 +85,21 @@ Deno.test("handleCreate returns 400 when publicKey exceeds max length", async ()
   assertEquals(body.error.includes("publicKey"), true);
 });
 
+// --- Security: walletRef binding (identity-forgery guard) ---
+
+Deno.test("handleCreate rejects a walletRef that does not match the publicKey", async () => {
+  setup();
+  const res = await handleCreate(makeCreateRequest({
+    ...VALID_BODY,
+    credentialId: "wr-bind-test",
+    // valid 32-byte hex, but NOT the address derived from publicKey → forgery attempt
+    walletRef: "0x" + "11".repeat(32),
+  }));
+  assertEquals(res.status, 400);
+  const body = await res.json();
+  assertEquals(body.error.includes("walletRef"), true);
+});
+
 // --- handleCreateStatus ---
 
 Deno.test("handleCreateStatus returns 404 for unknown id", () => {

@@ -44,6 +44,8 @@ export function redactSecrets(input: string): string {
   return input
     // Alchemy/Infura-style API key in the URL path: /v2/<key>, /v3/<key>
     .replace(/(\/v[0-9]\/)[A-Za-z0-9_-]{6,}/g, "$1***")
+    // Telegram bot token in an api.telegram.org URL: /bot<id>:<secret>/
+    .replace(/(\/bot)[0-9]{6,}:[A-Za-z0-9_-]{20,}/g, "$1***")
     // key / apikey / api_key / token / secret query params
     .replace(/([?&](?:api[_-]?key|apikey|key|token|secret|access_token)=)[^&\s"]+/gi, "$1***");
 }

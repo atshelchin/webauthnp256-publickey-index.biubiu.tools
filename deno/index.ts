@@ -6,6 +6,7 @@ import { handleChallenge } from "../shared/routes/challenge.ts";
 import { handleCreate, handleCreateStatus } from "./routes/create.ts";
 import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../shared/routes/stats.ts";
 import { initQueue, startQueueWorker, getQueueStats } from "./queue.ts";
+import { setIpHashSalt } from "../shared/queue.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
 import { log, newRequestId } from "../shared/log.ts";
 
@@ -13,6 +14,9 @@ const HOME_HTML = await Deno.readTextFile(new URL("./index.html", import.meta.ur
 
 const config = initConfig();
 if (config.alchemyApiKey) setAlchemyRpc(config.alchemyApiKey);
+// Salt IP hashing with a server secret so stored hashes can't be brute-forced
+// back to raw IPs if the DB leaks. PRIVATE_KEY is the always-present secret.
+setIpHashSalt(config.privateKey || "webauthnp256-index");
 await initRpc();
 initQueue(config.queueDbPath);
 

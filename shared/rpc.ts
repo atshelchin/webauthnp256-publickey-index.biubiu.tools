@@ -26,6 +26,33 @@ const WRITE_RPCS = [
 ];
 let writeIndex = 0;
 
+// Allowlist of reputable Gnosis RPC HOSTS. The RPC list is fetched at runtime
+// from a third-party URL (CHAIN_DATA_URL); if that source were compromised it
+// could inject an attacker-controlled "RPC" that forges on-chain reads (record
+// substitution / false not-found). We only adopt fetched endpoints whose host
+// is on this list, so a poisoned source can at worst reorder known-good hosts.
+const ALLOWED_RPC_HOSTS = new Set<string>([
+  "rpc.gnosischain.com",
+  "gnosis-rpc.publicnode.com",
+  "gnosis.drpc.org",
+  "1rpc.io",
+  "gnosis-mainnet.public.blastapi.io",
+  "gnosis.api.onfinality.io",
+  "rpc.gnosis.gateway.fm",
+  "gnosis-pokt.nodies.app",
+  "gnosis.blockpi.network",
+  "rpc.ankr.com",
+  "gnosischain-rpc.gateway.pokt.network",
+]);
+
+function isAllowedRpcHost(url: string): boolean {
+  try {
+    return ALLOWED_RPC_HOSTS.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
 let rpcList: string[] = [...FALLBACK_RPCS];
 let currentIndex = 0;
 let lastRefresh = 0;
@@ -43,7 +70,9 @@ async function fetchRpcList(): Promise<string[]> {
     // Extract HTTP(S) RPC URLs from the chain data
     for (const provider of data.rpc ?? []) {
       const url = typeof provider === "string" ? provider : provider?.url;
-      if (typeof url === "string" && url.startsWith("https://") && !url.includes("${")) {
+      // Only adopt https endpoints on the reputable-host allowlist — a poisoned
+      // chain-data source must not be able to inject a data-forging RPC.
+      if (typeof url === "string" && url.startsWith("https://") && !url.includes("${") && isAllowedRpcHost(url)) {
         rpcs.push(url);
       }
     }
