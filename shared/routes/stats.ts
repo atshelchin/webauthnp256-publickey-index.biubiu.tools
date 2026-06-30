@@ -1,6 +1,12 @@
 import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract-read.ts";
-import { cacheGet, cacheSet } from "../cache.ts";
+import { cacheGet, cacheGetStale, cacheSet } from "../cache.ts";
 import { validateStringLength } from "../validation.ts";
+import { isDependencyError, serveStaleOrDependency, STALE_MAX_MS_STATS } from "./errors.ts";
+
+/** On a dependency outage, serve last-known-good (≤1h old) if we have it, else 503. */
+function degraded(cacheKey: string, err: import("../reliability.ts").DependencyError): Response {
+  return serveStaleOrDependency(cacheGetStale<object>(cacheKey), STALE_MAX_MS_STATS, err);
+}
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
@@ -21,11 +27,16 @@ export async function handleListRpIds(req: Request): Promise<Response> {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = await listRpIds(page, pageSize, order);
-  if (result.items.length > 0) {
-    cacheSet(cacheKey, result);
+  try {
+    const result = await listRpIds(page, pageSize, order);
+    if (result.items.length > 0) {
+      cacheSet(cacheKey, result);
+    }
+    return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
+  } catch (err) {
+    if (isDependencyError(err)) return degraded(cacheKey, err);
+    throw err;
   }
-  return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
 }
 
 export async function handleTotalCredentials(): Promise<Response> {
@@ -35,10 +46,15 @@ export async function handleTotalCredentials(): Promise<Response> {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const total = await getTotalCredentials();
-  const result = { totalCredentials: total };
-  cacheSet(cacheKey, result);
-  return Response.json(result, { headers: CACHE_HEADERS });
+  try {
+    const total = await getTotalCredentials();
+    const result = { totalCredentials: total };
+    cacheSet(cacheKey, result);
+    return Response.json(result, { headers: CACHE_HEADERS });
+  } catch (err) {
+    if (isDependencyError(err)) return degraded(cacheKey, err);
+    throw err;
+  }
 }
 
 export async function handleListPublicKeys(req: Request): Promise<Response> {
@@ -61,9 +77,14 @@ export async function handleListPublicKeys(req: Request): Promise<Response> {
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = await listPublicKeysByRpId(rpId, page, pageSize, order);
-  if (result.items.length > 0) {
-    cacheSet(cacheKey, result);
+  try {
+    const result = await listPublicKeysByRpId(rpId, page, pageSize, order);
+    if (result.items.length > 0) {
+      cacheSet(cacheKey, result);
+    }
+    return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
+  } catch (err) {
+    if (isDependencyError(err)) return degraded(cacheKey, err);
+    throw err;
   }
-  return Response.json(result, { headers: result.items.length > 0 ? CACHE_HEADERS : undefined });
 }

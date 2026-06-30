@@ -1,9 +1,12 @@
 import { getPublicKey } from "../../shared/contract-read.ts";
-import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.ts";
+import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
 import { cacheGet, cacheSet } from "../../shared/cache.ts";
 import { validateStringLength } from "../../shared/validation.ts";
+import { isDependencyError } from "../../shared/routes/errors.ts";
+import { MAX_ACTIVE_QUEUE_DEPTH } from "../../shared/routes/health.ts";
+import { log } from "../../shared/log.ts";
 
 const MAX_BODY_SIZE = 32 * 1024;
 
@@ -77,7 +80,18 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
   if (cached) {
     return Response.json({ ...cached, status: "done" }, { status: 201 });
   }
-  const existing = await getPublicKey(rpId, credentialId);
+  // Precheck is a fast-path only; a transient chain outage must not fail create.
+  // We fall through to enqueue and let the worker's hasRecord reconciliation
+  // converge safely (idempotent — marks done if the record is already on-chain).
+  let existing = null;
+  try {
+    existing = await getPublicKey(rpId, credentialId);
+  } catch (err) {
+    if (!isDependencyError(err)) throw err;
+    log.warn("create precheck skipped: chain unreachable, enqueueing anyway", {
+      dependency: "rpc", operation: "getRecord", rpId, error_category: err.classified.category,
+    });
+  }
   if (existing) {
     cacheSet(cacheKey, existing);
     return Response.json({ ...existing, status: "done" }, { status: 201 });
@@ -88,6 +102,18 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
   if (queued && queued.status !== "failed") {
     return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
   }
+
+  // Backpressure: shed genuinely-new work when the active queue is dangerously
+  // deep. Fail-open on a stats hiccup (never block a create on a counting error).
+  try {
+    if (await getActiveQueueDepth(db) >= MAX_ACTIVE_QUEUE_DEPTH) {
+      log.warn("create shed: queue backpressure", { operation: "create", outcome: "shed" });
+      return Response.json(
+        { error: "service busy, please retry shortly", retryable: true },
+        { status: 503, headers: { "Retry-After": "30" } },
+      );
+    }
+  } catch { /* stats unavailable — allow the create */ }
 
   // Enqueue
   const id = await enqueue(db, { rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip });

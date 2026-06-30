@@ -33,7 +33,9 @@ function getAccountForRole(role: string, config: AppConfig) {
 async function fetchOnChainNonce(role: string, config: AppConfig): Promise<number> {
   const client = createPublicClient({
     chain: gnosis,
-    transport: http(getWriteRpc()),
+    // Bounded budget: runs inside the per-role nonce mutex (stalls the DO alarm
+    // if slow). 5s × 1 retry instead of viem's ~40s default.
+    transport: http(getWriteRpc(), { timeout: 5_000, retryCount: 1 }),
   });
   return await client.getTransactionCount({
     address: getAccountForRole(role, config).address,

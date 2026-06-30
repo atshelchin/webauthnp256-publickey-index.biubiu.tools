@@ -1,5 +1,5 @@
 import { assertEquals, assert } from "@std/assert/";
-import { cacheGet, cacheSet, cacheClear, cacheSize, cacheMemoryUsage, _configureForTest, _resetConfigForTest } from "../../shared/cache.ts";
+import { cacheGet, cacheGetStale, cacheSet, cacheClear, cacheSize, cacheMemoryUsage, _configureForTest, _resetConfigForTest } from "../../shared/cache.ts";
 
 function setup() {
   cacheClear();
@@ -70,15 +70,34 @@ Deno.test("cacheGet returns undefined after TTL expires", async () => {
   assertEquals(cacheGet("ttl-key"), undefined); // expired
 });
 
-Deno.test("expired entry is removed from store on access", async () => {
+Deno.test("expired entry is retained as last-known-good (not served fresh)", async () => {
   setup();
   _configureForTest({ ttl: 50 });
   cacheSet("exp", "data");
   assertEquals(cacheSize(), 1);
   await new Promise((r) => setTimeout(r, 60));
-  cacheGet("exp"); // triggers cleanup
-  assertEquals(cacheSize(), 0);
-  assertEquals(cacheMemoryUsage(), 0);
+  // Not returned as fresh...
+  assertEquals(cacheGet("exp"), undefined);
+  // ...but retained so it can serve as last-known-good during an upstream outage.
+  assertEquals(cacheSize(), 1);
+  const stale = cacheGetStale<string>("exp");
+  assert(stale !== undefined);
+  assertEquals(stale!.value, "data");
+  assert(stale!.ageMs >= 50);
+});
+
+Deno.test("cacheGetStale returns undefined for a never-set key", () => {
+  setup();
+  assertEquals(cacheGetStale("never"), undefined);
+});
+
+Deno.test("cacheGetStale returns fresh values too (age ~0)", () => {
+  setup();
+  cacheSet("k", { n: 1 });
+  const stale = cacheGetStale<{ n: number }>("k");
+  assert(stale !== undefined);
+  assertEquals(stale!.value, { n: 1 });
+  assert(stale!.ageMs >= 0);
 });
 
 // --- Memory eviction ---

@@ -4,13 +4,15 @@
  * challenge.ts, stats.ts routes with Deno version.
  * Only queue (D1 vs SQLite) and config (env bindings vs Deno.env) differ.
  */
-import { initRpc } from "../shared/rpc.ts";
+import { initRpc, getReadCircuitState } from "../shared/rpc.ts";
 import { CONTRACT_ADDRESS } from "../shared/contract.ts";
 import { handleChallenge } from "../shared/routes/challenge.ts";
 import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../shared/routes/stats.ts";
 import { handleQuery } from "./routes/query.ts";
 import { handleCreate, handleCreateStatus } from "./routes/create.ts";
-import { initQueue } from "./queue.ts";
+import { initQueue, getQueueStats } from "./queue.ts";
+import { buildHealthBody } from "../shared/routes/health.ts";
+import { log, newRequestId } from "../shared/log.ts";
 import type { Env } from "./types.ts";
 
 export { QueueProcessor } from "./queue-processor.ts";
@@ -56,6 +58,8 @@ export default {
 
     const url = new URL(request.url);
     const path = url.pathname;
+    const requestId = newRequestId();
+    const start = Date.now();
 
     let response: Response;
 
@@ -65,14 +69,17 @@ export default {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       } else if (path === "/api/health" && request.method === "GET") {
-        response = Response.json({
+        const base = {
           service: "webauthn-p256-publickey-index",
           version: "1.0.0",
           runtime: "cloudflare-workers",
           chainId: 100,
           contract: CONTRACT_ADDRESS,
-          status: "ok",
-        });
+          rpcCircuit: getReadCircuitState(),
+        };
+        let stats = null;
+        try { stats = await getQueueStats(env.DB); } catch { /* DB hiccup → degraded */ }
+        response = Response.json(buildHealthBody(base, stats));
       } else if (path === "/api/challenge" && request.method === "GET") {
         response = handleChallenge();
       } else if (path === "/api/query" && request.method === "GET") {
@@ -91,9 +98,16 @@ export default {
         response = Response.json({ error: "not found" }, { status: 404 });
       }
     } catch (error) {
-      console.error("Unhandled error:", error);
-      response = Response.json({ error: "internal server error" }, { status: 500 });
+      log.error("http unhandled error", { request_id: requestId, method: request.method, path, error: String(error) });
+      response = Response.json({ error: "internal server error", request_id: requestId }, { status: 500 });
     }
+
+    // Only log non-trivial outcomes (errors / degraded) to keep edge logs lean;
+    // CF already records every invocation. A request_id correlates the two.
+    if (response.status >= 400 || response.headers.get("X-Served-Stale")) {
+      log.info("http response", { request_id: requestId, method: request.method, path, status: response.status, latency_ms: Date.now() - start });
+    }
+    response.headers.set("X-Request-Id", requestId);
 
     // Ensure queue processor DO is running
     ctx.waitUntil((async () => {

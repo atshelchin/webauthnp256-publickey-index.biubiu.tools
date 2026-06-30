@@ -1,7 +1,10 @@
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../index.ts";
-import { initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit } from "../queue.ts";
+import {
+  initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit,
+  getQueueStats, withD1Retry, isTransientD1Error,
+} from "../queue.ts";
 
 // Helpers
 function makeRequest(path: string, opts?: RequestInit) {
@@ -187,5 +190,58 @@ describe("D1 Queue", () => {
     }
     // ip1 exhausted, ip2 should still work
     expect(await checkRateLimit(env.DB, ip2)).toBe(true);
+  });
+
+  it("enqueue is idempotent under concurrent identical creates", async () => {
+    const params = {
+      rpId: "idem.example.com", credentialId: `c-${Date.now()}`,
+      walletRef: "0x" + "ab".repeat(32), publicKey: "04" + "aa".repeat(64),
+      name: "k", initialCredentialId: "x", metadata: "0x", ip: "127.0.0.1",
+    };
+    params.initialCredentialId = params.credentialId;
+    const [id1, id2] = await Promise.all([enqueue(env.DB, params), enqueue(env.DB, params)]);
+    expect(id1).toBe(id2);
+    const { results } = await env.DB.prepare(
+      "SELECT id FROM create_queue WHERE rpId = ? AND credentialId = ? AND status != 'failed'",
+    ).bind(params.rpId, params.credentialId).all();
+    expect(results.length).toBe(1);
+  });
+
+  it("getQueueStats reports active depth and dlq count", async () => {
+    const stats = await getQueueStats(env.DB);
+    expect(typeof stats.queueDepth).toBe("number");
+    expect(typeof stats.dlqCount).toBe("number");
+    expect(stats.queueDepth).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// --- D1 transient-retry ---
+
+describe("withD1Retry", () => {
+  it("classifies D1 transient patterns", () => {
+    expect(isTransientD1Error(new Error("D1_ERROR: storage operation exceeded timeout which caused object to be reset"))).toBe(true);
+    expect(isTransientD1Error(new Error("network connection lost"))).toBe(true);
+    expect(isTransientD1Error(new Error("UNIQUE constraint failed"))).toBe(false);
+    expect(isTransientD1Error(new Error("syntax error"))).toBe(false);
+  });
+
+  it("retries a transient failure then succeeds", async () => {
+    let calls = 0;
+    const result = await withD1Retry(async () => {
+      calls++;
+      if (calls < 2) throw new Error("D1_ERROR: storage operation exceeded timeout");
+      return "ok";
+    });
+    expect(result).toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  it("does NOT retry a non-transient error (e.g. unique constraint)", async () => {
+    let calls = 0;
+    await expect(withD1Retry(async () => {
+      calls++;
+      throw new Error("UNIQUE constraint failed: create_queue.rpId, create_queue.credentialId");
+    })).rejects.toThrow(/UNIQUE constraint/);
+    expect(calls).toBe(1);
   });
 });

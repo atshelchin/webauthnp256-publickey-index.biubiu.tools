@@ -41,7 +41,9 @@ function getAccountForRole(role: string) {
 async function fetchOnChainNonce(role: string): Promise<number> {
   const client = createPublicClient({
     chain: gnosis,
-    transport: http(getWriteRpc()),
+    // Bounded budget: this runs inside the per-role nonce mutex, so a slow node
+    // here serializes/stalls every tx send for the role. 5s × 1 retry, not 40s.
+    transport: http(getWriteRpc(), { timeout: 5_000, retryCount: 1 }),
   });
   const nonce = await client.getTransactionCount({
     address: getAccountForRole(role).address,

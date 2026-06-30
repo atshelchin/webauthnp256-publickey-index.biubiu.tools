@@ -4,6 +4,8 @@
  * through endpoints on failure.
  */
 
+import { redactSecrets } from "./log.ts";
+
 const CHAIN_DATA_URL = "https://ethereum-data.awesometools.dev/chains/eip155-100.json";
 const REFRESH_INTERVAL = 15 * 60_000; // refresh RPC list every 15 minutes
 const HEALTH_CHECK_TIMEOUT = 5000; // 5s
@@ -113,12 +115,64 @@ export function getWriteRpc(): string {
 
 export function markFailed(url: string): void {
   failedRpcs.set(url, Date.now());
-  console.warn(`[rpc] Marked as failed (1min cooldown): ${url}`);
+  console.warn(`[rpc] Marked as failed (1min cooldown): ${redactSecrets(url)}`);
+}
+
+/**
+ * Clear an endpoint's failed mark — call on a SUCCESSFUL use so the circuit
+ * recovers the instant any endpoint works again, instead of waiting out the
+ * full 60s cooldown.
+ */
+export function markHealthy(url: string): void {
+  if (failedRpcs.delete(url)) {
+    console.log(`[rpc] Recovered: ${redactSecrets(url)}`);
+  }
+}
+
+// Half-open: while the read circuit is open, let ONE probe request through every
+// PROBE_INTERVAL so recovery is detected in seconds, not a fixed 60s, without
+// hammering known-dead nodes with the full request volume.
+const PROBE_INTERVAL = 5_000;
+let lastProbeAt = 0;
+
+/** Returns true at most once per PROBE_INTERVAL — the caller may probe-through. */
+export function tryReadProbe(): boolean {
+  const now = Date.now();
+  if (now - lastProbeAt < PROBE_INTERVAL) return false;
+  lastProbeAt = now;
+  return true;
+}
+
+/**
+ * Read-path circuit state. "open" means EVERY known read endpoint is currently
+ * in cooldown (all marked bad) — so a read should fast-fail with 503 instead of
+ * burning the whole retry deadline hammering known-dead nodes. As soon as any
+ * cooldown expires this returns "closed" again (the next request probes it),
+ * giving free half-open behaviour. `isAvailable` also prunes expired entries.
+ */
+export function getReadCircuitState(): "open" | "closed" {
+  if (rpcList.length === 0) return "open";
+  for (const url of rpcList) {
+    if (isAvailable(url)) return "closed";
+  }
+  return "open";
+}
+
+/** How many ms until the soonest read endpoint leaves cooldown (for Retry-After). */
+export function readCircuitRetryAfterMs(): number {
+  let soonest = BAD_RPC_COOLDOWN;
+  const now = Date.now();
+  for (const url of rpcList) {
+    const failedAt = failedRpcs.get(url);
+    if (failedAt === undefined) return 0; // something is available now
+    soonest = Math.min(soonest, Math.max(0, BAD_RPC_COOLDOWN - (now - failedAt)));
+  }
+  return soonest;
 }
 
 export function failover(): string {
   const next = getCurrentRpc();
-  console.warn(`[rpc] Failover to: ${next}`);
+  console.warn(`[rpc] Failover to: ${redactSecrets(next)}`);
   return next;
 }
 
@@ -167,6 +221,7 @@ export function _resetForTest(rpcs?: string[]): void {
   writeIndex = 0;
   failedRpcs.clear();
   lastRefresh = Date.now();
+  lastProbeAt = 0;
 }
 
 async function isHealthy(url: string): Promise<boolean> {

@@ -8,6 +8,7 @@ interface CacheEntry {
   value: unknown;
   size: number;
   expiresAt: number;
+  storedAt: number;
 }
 
 // Map preserves insertion order — oldest entries are first
@@ -18,6 +19,15 @@ const encoder = new TextEncoder();
 
 function estimateSize(value: unknown): number {
   return encoder.encode(JSON.stringify(value)).byteLength;
+}
+
+// Approximate LRU: a touched entry moves to the Map tail (most-recently-used),
+// so evictOldest (which deletes from the front) reclaims the COLDEST entries
+// first — keeping hot entries, including hot last-known-good, available for an
+// outage instead of evicting them in blind insertion order.
+function touch(key: string, entry: CacheEntry): void {
+  store.delete(key);
+  store.set(key, entry);
 }
 
 function evictOldest(): void {
@@ -31,12 +41,24 @@ function evictOldest(): void {
 export function cacheGet<T>(key: string): T | undefined {
   const entry = store.get(key);
   if (!entry) return undefined;
-  if (Date.now() > entry.expiresAt) {
-    totalSize -= entry.size;
-    store.delete(key);
-    return undefined;
-  }
+  // Expired: not fresh, but RETAINED (not deleted) so it can still serve as
+  // last-known-good if an upstream read fails. Don't promote it on this path —
+  // a fresh fetch will re-cache it. cacheGetStale() reads/promotes these.
+  if (Date.now() > entry.expiresAt) return undefined;
+  touch(key, entry); // hot fresh entry → keep it
   return entry.value as T;
+}
+
+/**
+ * Last-known-good read: returns the value even if the TTL has expired, with its
+ * age. Used to degrade gracefully ("serve slightly stale, marked") when the
+ * authoritative upstream (chain RPC) is unreachable, instead of erroring.
+ */
+export function cacheGetStale<T>(key: string): { value: T; ageMs: number } | undefined {
+  const entry = store.get(key);
+  if (!entry) return undefined;
+  touch(key, entry); // a served LKG entry is hot → protect it from eviction
+  return { value: entry.value as T, ageMs: Date.now() - entry.storedAt };
 }
 
 export function cacheSet<T>(key: string, value: T): void {
@@ -48,7 +70,8 @@ export function cacheSet<T>(key: string, value: T): void {
 
   const size = estimateSize(value);
   totalSize += size;
-  store.set(key, { value, size, expiresAt: Date.now() + CACHE_TTL });
+  const now = Date.now();
+  store.set(key, { value, size, expiresAt: now + CACHE_TTL, storedAt: now });
 
   if (totalSize > MAX_MEMORY_BYTES) {
     evictOldest();

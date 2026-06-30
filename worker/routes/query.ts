@@ -1,7 +1,8 @@
 import { getPublicKey, getPublicKeyByWalletRef } from "../../shared/contract-read.ts";
-import { cacheGet, cacheSet } from "../../shared/cache.ts";
+import { cacheGet, cacheGetStale, cacheSet } from "../../shared/cache.ts";
 import { findDuplicate } from "../queue.ts";
 import { validateStringLength } from "../../shared/validation.ts";
+import { isDependencyError, serveStaleOrDependency, STALE_MAX_MS_RECORD } from "../../shared/routes/errors.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
@@ -27,7 +28,15 @@ export async function handleQuery(req: Request, db: D1Database): Promise<Respons
       return Response.json(cached, { headers: CACHE_HEADERS });
     }
 
-    const result = await getPublicKeyByWalletRef(walletRef as `0x${string}`);
+    let result;
+    try {
+      result = await getPublicKeyByWalletRef(walletRef as `0x${string}`);
+    } catch (err) {
+      if (isDependencyError(err)) {
+        return serveStaleOrDependency(cacheGetStale<object>(cacheKey), STALE_MAX_MS_RECORD, err);
+      }
+      throw err;
+    }
     if (result) {
       cacheSet(cacheKey, result);
       return Response.json(result, { headers: CACHE_HEADERS });
@@ -45,7 +54,15 @@ export async function handleQuery(req: Request, db: D1Database): Promise<Respons
     return Response.json(cached, { headers: CACHE_HEADERS });
   }
 
-  const result = await getPublicKey(rpId, credentialId);
+  let result;
+  try {
+    result = await getPublicKey(rpId, credentialId);
+  } catch (err) {
+    if (isDependencyError(err)) {
+      return serveStaleOrDependency(cacheGetStale<object>(cacheKey), STALE_MAX_MS_RECORD, err);
+    }
+    throw err;
+  }
   if (result) {
     cacheSet(cacheKey, result);
     return Response.json(result, { headers: CACHE_HEADERS });

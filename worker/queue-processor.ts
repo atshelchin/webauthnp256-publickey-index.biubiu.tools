@@ -28,10 +28,19 @@ import {
   getCreateWallet,
   getCommitWallet,
   sendTelegram,
+  splitByHasRecord,
+  batchFailureAction,
+  retryDelayMs,
 } from "../shared/queue.ts";
 import { acquireNonce } from "./nonce.ts";
 import { buildConfig } from "./config.ts";
+import { log, redactSecrets } from "../shared/log.ts";
 import type { Env } from "./types.ts";
+
+function shortMsg(err: unknown): string {
+  // Redact embedded RPC credentials before storing in the 'error' column / logs.
+  return redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
+}
 
 const ALARM_INTERVAL = 10_000; // 10s
 const ALERT_INTERVAL = 5 * 60_000;
@@ -63,12 +72,15 @@ export class QueueProcessor implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    const start = Date.now();
     try {
       await this.processQueue();
+      log.info("queue alarm cycle done", { operation: "processQueue", latency_ms: Date.now() - start, outcome: "success" });
     } catch (err) {
-      console.error("[queue-processor] Error:", err);
+      log.error("queue alarm cycle error", { operation: "processQueue", latency_ms: Date.now() - start, error: shortMsg(err) });
     }
-    // Re-schedule
+    // Always re-schedule — a failed/slow cycle must never leave the alarm unset
+    // (that would silently stop all queue processing).
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
   }
 
@@ -119,6 +131,10 @@ export class QueueProcessor implements DurableObject {
     await this.checkAlerts(config);
   }
 
+  // Reconciles any item left in the legacy 'creating' status. No NEW item enters
+  // 'creating' (the flow goes committed→done directly); retained as a rolling-
+  // upgrade safety net so a row written 'creating' by an older build is confirmed
+  // on-chain (→ done) or failed out rather than stranded.
   private async processCreating(_config: AppConfig): Promise<void> {
     const { results } = await this.db.prepare(
       "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
@@ -215,9 +231,10 @@ export class QueueProcessor implements DurableObject {
           } else {
             const COMMIT_COOLDOWN = 2 * 60_000;
             if (Date.now() - item.updatedAt >= COMMIT_COOLDOWN) {
-              await this.db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?")
-                .bind(Date.now(), item.id).run();
-              console.warn(`[queue-processor] Item ${item.id} commitment missing, resetting to pending`);
+              // Re-commit THROUGH handleFailure so retries/retryAfter advance —
+              // otherwise a never-confirming commit oscillates committed↔pending
+              // forever with no progress.
+              await this.handleFailure(item, "commitment missing after cooldown, re-committing", "pending");
             }
           }
         }
@@ -228,8 +245,14 @@ export class QueueProcessor implements DurableObject {
 
     const { wallet, client: walletClient } = getCreateWallet(config);
 
-    for (let offset = 0; offset < ready.length; offset += CREATE_SUB_BATCH) {
-      const batch = ready.slice(offset, offset + CREATE_SUB_BATCH);
+    // Reconciliation: drop items already on-chain (a prior createRecord landed
+    // while our receipt wait timed out, or was created out of band). Re-sending
+    // them would revert the WHOLE batch (RecordAlreadyExists).
+    const missing = await this.reconcileReady(walletClient, ready);
+    if (missing.length === 0) return;
+
+    for (let offset = 0; offset < missing.length; offset += CREATE_SUB_BATCH) {
+      const batch = missing.slice(offset, offset + CREATE_SUB_BATCH);
       const params = batch.map((item) => {
         const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
         return {
@@ -273,12 +296,130 @@ export class QueueProcessor implements DurableObject {
             .bind(hash, now, item.id)
         );
         await this.db.batch(stmts);
-        console.log(`[queue-processor] batchCreateRecord: ${batch.length} items confirmed, done`);
+        log.info("batchCreateRecord confirmed", { operation: "batchCreateRecord", count: batch.length, outcome: "success" });
       } catch (err) {
         handle.release();
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[queue-processor] batchCreateRecord failed: ${msg.slice(0, 200)}`);
-        break;
+        const msg = shortMsg(err);
+        if (batchFailureAction(err) === "retry-transient") {
+          for (const item of batch) await this.handleFailure(item, `batchCreateRecord: ${msg}`, "committed");
+          log.warn("batchCreateRecord transient failure, backing off", { operation: "batchCreateRecord", count: batch.length, error_category: "transient" });
+          break;
+        }
+        log.warn("batchCreateRecord poison batch, isolating", { operation: "batchCreateRecord", count: batch.length, error_category: "poison" });
+        await this.isolatePoisonCreate(walletClient, wallet, batch);
+        // Do NOT break — let subsequent sub-batches proceed.
+      }
+    }
+  }
+
+  private markItemDone(item: QueueItem, txHash = ""): Promise<unknown> {
+    return this.db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
+      .bind(txHash || item.txHash || "", Date.now(), item.id).run();
+  }
+
+  /** Mark already-on-chain 'ready' items done; return the genuinely-missing ones. */
+  // deno-lint-ignore no-explicit-any
+  private async reconcileReady(client: any, items: QueueItem[]): Promise<QueueItem[]> {
+    const calls = items.map((item) => ({
+      address: CONTRACT_ADDRESS as `0x${string}`,
+      abi: CONTRACT_ABI,
+      functionName: "hasRecord" as const,
+      args: [item.rpId, item.credentialId] as const,
+    }));
+    let results;
+    try {
+      results = await client.multicall({ contracts: calls });
+    } catch (err) {
+      log.warn("reconcileReady multicall failed, retrying full set next cycle", { operation: "hasRecord", error_category: "transient", error: shortMsg(err) });
+      return items;
+    }
+    const { present, missing } = splitByHasRecord(items, results);
+    if (present.length > 0) {
+      await this.db.batch(present.map((item) =>
+        this.db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").bind(Date.now(), item.id)
+      ));
+      log.info("reconciled already-on-chain items to done", { operation: "reconcile", count: present.length, outcome: "success" });
+    }
+    return missing;
+  }
+
+  /**
+   * Poison isolation for createRecord: process each item INDIVIDUALLY so the
+   * batch always makes forward progress, even when items conflict with EACH
+   * OTHER (e.g. two credentials sharing a walletRef — only one can win).
+   * Per item: already on-chain → done; else fresh estimate + single-item send +
+   * receipt. Sequential, so once one lands the next conflicting one reverts and
+   * is quarantined. Every item ends done / quarantined / transient-backoff.
+   */
+  // deno-lint-ignore no-explicit-any
+  private async isolatePoisonCreate(client: any, wallet: any, items: QueueItem[]): Promise<void> {
+    const config = await this.getConfig(); // hoisted: avoid re-deriving the key per item
+    for (const item of items) {
+      try {
+        const has = await client.readContract({
+          address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, functionName: "hasRecord", args: [item.rpId, item.credentialId],
+        });
+        if (has) { await this.markItemDone(item); continue; }
+      } catch { /* fall through to per-item submit */ }
+
+      const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
+      const param = {
+        rpId: item.rpId, credentialId: item.credentialId, walletRef: walletRefHex,
+        publicKey: publicKeyHex, name: item.name, initialCredentialId: item.initialCredentialId, metadata: metadataHex,
+      };
+
+      let gasEstimate: bigint;
+      try {
+        gasEstimate = await client.estimateContractGas({
+          address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
+          args: [CONTRACT_ADDRESS, [param]], account: wallet.account,
+        });
+      } catch (err) {
+        if (batchFailureAction(err) === "isolate-poison") {
+          await this.handleFailure(item, `batchCreateRecord poison: ${shortMsg(err)}`, "committed", { poison: true });
+        } else {
+          await this.handleFailure(item, `batchCreateRecord transient during isolation: ${shortMsg(err)}`, "committed");
+        }
+        continue;
+      }
+
+      const handle = await acquireNonce("create", config);
+      try {
+        const hash = await wallet.writeContract({
+          address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
+          args: [CONTRACT_ADDRESS, [param]], nonce: handle.nonce, gas: gasEstimate * 120n / 100n,
+        });
+        const receipt = await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
+        if (receipt.status === "reverted") throw new Error(`reverted: ${hash}`);
+        await this.markItemDone(item, hash);
+        log.info("isolated item created individually", { job_id: item.id, operation: "batchCreateRecord", outcome: "success" });
+      } catch (err) {
+        handle.release();
+        if (batchFailureAction(err) === "isolate-poison") {
+          await this.handleFailure(item, `batchCreateRecord poison (individual send): ${shortMsg(err)}`, "committed", { poison: true });
+        } else {
+          await this.handleFailure(item, `batchCreateRecord transient (individual send): ${shortMsg(err)}`, "committed");
+        }
+      }
+    }
+  }
+
+  /** Poison isolation for batchCommit: quarantine items that deterministically revert. */
+  // deno-lint-ignore no-explicit-any
+  private async isolatePoisonCommit(client: any, wallet: any, items: QueueItem[]): Promise<void> {
+    for (const item of items) {
+      const { commitment } = buildCommitment(item);
+      try {
+        await client.estimateContractGas({
+          address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCommit",
+          args: [CONTRACT_ADDRESS, [commitment]], account: wallet.account,
+        });
+      } catch (err) {
+        if (batchFailureAction(err) === "isolate-poison") {
+          await this.handleFailure(item, `batchCommit poison: ${shortMsg(err)}`, "pending", { poison: true });
+        } else {
+          await this.handleFailure(item, `batchCommit transient during isolation: ${shortMsg(err)}`, "pending");
+        }
       }
     }
   }
@@ -323,10 +464,17 @@ export class QueueProcessor implements DurableObject {
           .bind(now, item.id)
       );
       await this.db.batch(stmts);
-      console.log(`[queue-processor] batchCommit: ${items.length} items confirmed in 1 tx`);
+      log.info("batchCommit confirmed", { operation: "batchCommit", count: items.length, outcome: "success" });
     } catch (err) {
       handle.release();
-      console.warn(`[queue-processor] batchCommit failed: ${err instanceof Error ? err.message : err}`);
+      const msg = shortMsg(err);
+      if (batchFailureAction(err) === "retry-transient") {
+        for (const item of items) await this.handleFailure(item, `batchCommit: ${msg}`, "pending");
+        log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items.length, error_category: "transient" });
+      } else {
+        log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items.length, error_category: "poison" });
+        await this.isolatePoisonCommit(commitClient, wallet, items);
+      }
     }
   }
 
@@ -339,18 +487,31 @@ export class QueueProcessor implements DurableObject {
     }
   }
 
-  private async handleFailure(item: QueueItem, error: string, retryStatus: "pending" | "committed" = "pending"): Promise<void> {
+  private async handleFailure(
+    item: QueueItem,
+    error: string,
+    retryStatus: "pending" | "committed" = "pending",
+    opts?: { poison?: boolean },
+  ): Promise<void> {
     const retries = item.retries + 1;
-    if (retries >= MAX_RETRIES) {
+    const terminal = opts?.poison || retries >= MAX_RETRIES;
+    if (terminal) {
+      const prefix = opts?.poison ? "POISON" : "EXHAUSTED";
       await this.db.prepare("UPDATE create_queue SET status = 'failed', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
-        .bind(error, retries, Date.now(), item.id).run();
-      console.error(`[queue-processor] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
+        .bind(`${prefix}: ${error}`, retries, Date.now(), item.id).run();
+      log.error("queue item quarantined to DLQ", {
+        job_id: item.id, operation: "tx", outcome: opts?.poison ? "poison" : "exhausted",
+        error_category: opts?.poison ? "poison" : "transient", retries,
+      });
     } else {
-      const delay = Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
+      const delay = retryDelayMs(retries);
       const retryAfter = Date.now() + delay;
       await this.db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
         .bind(retryStatus, error, retries, retryAfter, Date.now(), item.id).run();
-      console.warn(`[queue-processor] Item ${item.id} retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s`);
+      log.warn("queue item retry scheduled", {
+        job_id: item.id, operation: "tx", outcome: "retry", attempt: retries,
+        error_category: "transient", next_retry_in_s: Math.round(delay / 1000),
+      });
     }
 
     this.failuresSinceLastAlert++;
@@ -358,7 +519,7 @@ export class QueueProcessor implements DurableObject {
       const config = await this.getConfig();
       const failed = await this.db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'")
         .first<{ count: number }>();
-      await sendTelegram(config, `🔴 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${this.failuresSinceLastAlert} tx failures\nTotal failed: ${failed?.count ?? 0}\nLatest: ${error}`);
+      await sendTelegram(config, `🔴 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${this.failuresSinceLastAlert} tx failures\nTotal in DLQ (failed): ${failed?.count ?? 0}\nLatest: ${error}`);
       this.failuresSinceLastAlert = 0;
     }
   }

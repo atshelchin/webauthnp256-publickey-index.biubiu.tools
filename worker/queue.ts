@@ -9,8 +9,13 @@ import {
   RATE_WINDOW,
   DEFAULT_RATE_LIMIT,
   CREATE_QUEUE_DDL,
+  CREATE_ACTIVE_UNIQUE_INDEX,
+  DEDUPE_ACTIVE_DUPLICATES_SQL,
+  isUniqueConstraintError,
   hashIp,
 } from "../shared/queue.ts";
+import { log } from "../shared/log.ts";
+import type { QueueStats } from "../shared/routes/health.ts";
 
 export type { QueueStatus, QueueItem };
 
@@ -29,12 +34,12 @@ const D1_TRANSIENT_PATTERNS = [
   "storage operation",
 ];
 
-function isTransientD1Error(err: unknown): boolean {
+export function isTransientD1Error(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return D1_TRANSIENT_PATTERNS.some((p) => msg.includes(p));
 }
 
-async function withD1Retry<T>(op: () => Promise<T>, attempts = 3): Promise<T> {
+export async function withD1Retry<T>(op: () => Promise<T>, attempts = 3): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -55,6 +60,11 @@ export async function initQueue(db: D1Database): Promise<void> {
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)"),
+    // Idempotency: dedupe any pre-existing active duplicates (ordered before the
+    // unique index so it can build on a DB that already contains duplicates),
+    // then enforce at-most-one-active-row per (rpId, credentialId).
+    db.prepare(DEDUPE_ACTIVE_DUPLICATES_SQL).bind(Date.now()),
+    db.prepare(CREATE_ACTIVE_UNIQUE_INDEX),
     db.prepare(`
       CREATE TABLE IF NOT EXISTS rate_limits (
         ip_hash TEXT NOT NULL,
@@ -109,11 +119,24 @@ export async function enqueue(db: D1Database, params: {
   const id = crypto.randomUUID();
   const now = Date.now();
   const ipHash = await hashIp(params.ip);
-  await withD1Retry(() => db.prepare(`
-    INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
-    VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(id, params.rpId, params.credentialId, params.walletRef, params.publicKey, params.name, params.initialCredentialId, params.metadata, ipHash, now, now).run());
-  return id;
+  try {
+    await withD1Retry(() => db.prepare(`
+      INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
+      VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, params.rpId, params.credentialId, params.walletRef, params.publicKey, params.name, params.initialCredentialId, params.metadata, ipHash, now, now).run());
+    return id;
+  } catch (err) {
+    // Lost the race to a concurrent identical create — return the existing
+    // active row so the request stays idempotent (same job, not a duplicate).
+    if (isUniqueConstraintError(err)) {
+      const existing = await findDuplicate(db, params.rpId, params.credentialId);
+      if (existing && existing.status !== "failed") {
+        log.info("enqueue deduplicated to existing active job", { job_id: existing.id, operation: "enqueue" });
+        return existing.id;
+      }
+    }
+    throw err;
+  }
 }
 
 export async function getQueueItem(db: D1Database, id: string): Promise<QueueItem | null> {
@@ -122,10 +145,38 @@ export async function getQueueItem(db: D1Database, id: string): Promise<QueueIte
   ) ?? null;
 }
 
+/** Cheap single indexed COUNT of active items — for the create backpressure gate. */
+export async function getActiveQueueDepth(db: D1Database): Promise<number> {
+  const r = await withD1Retry(() =>
+    db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").first<{ c: number }>()
+  );
+  return r?.c ?? 0;
+}
+
+/** Queue health snapshot for /api/health. */
+export async function getQueueStats(db: D1Database): Promise<QueueStats> {
+  const row = await withD1Retry(() =>
+    db.prepare(
+      `SELECT
+         SUM(CASE WHEN status IN ('pending','committed','creating') THEN 1 ELSE 0 END) as depth,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as dlq,
+         MIN(CASE WHEN status IN ('pending','committed','creating') THEN createdAt ELSE NULL END) as oldest
+       FROM create_queue`,
+    ).first<{ depth: number | null; dlq: number | null; oldest: number | null }>()
+  );
+  return {
+    queueDepth: row?.depth ?? 0,
+    dlqCount: row?.dlq ?? 0,
+    oldestActiveAgeMs: row?.oldest ? Date.now() - row.oldest : 0,
+  };
+}
+
 export async function findDuplicate(db: D1Database, rpId: string, credentialId: string): Promise<QueueItem | null> {
+  // Prefer the ACTIVE row over a 'failed' (DLQ) one for the same key — a stale
+  // failed attempt must never shadow a live in-progress job. Deterministic ties.
   return await withD1Retry(() =>
     db.prepare(
-      "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY createdAt DESC LIMIT 1"
+      "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
     ).bind(rpId, credentialId).first<QueueItem>()
   ) ?? null;
 }

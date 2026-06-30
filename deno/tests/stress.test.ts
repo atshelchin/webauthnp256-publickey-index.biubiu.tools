@@ -6,10 +6,10 @@
  * Requires PRIVATE_KEY in .env with funded Gnosis Chain wallet.
  */
 
-import { assertEquals, assert } from "@std/assert/";
+import { assertEquals } from "@std/assert/";
 import { initConfig, getConfig } from "../config.ts";
 import { initRpc } from "../../shared/rpc.ts";
-import { initQueue, getQueueItem, startQueueWorker, _setRateLimitForTest, type QueueStatus } from "../queue.ts";
+import { initQueue, getQueueItem, startQueueWorker, _setRateLimitForTest } from "../queue.ts";
 import { handleCreate } from "../routes/create.ts";
 import { cacheClear } from "../../shared/cache.ts";
 

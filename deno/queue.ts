@@ -22,12 +22,20 @@ import {
   DONE_RETENTION,
   CREATE_SUB_BATCH,
   CREATE_QUEUE_DDL,
+  CREATE_ACTIVE_UNIQUE_INDEX,
+  DEDUPE_ACTIVE_DUPLICATES_SQL,
+  isUniqueConstraintError,
+  splitByHasRecord,
+  batchFailureAction,
+  retryDelayMs,
   hashIp,
   buildCommitment,
   getCreateWallet,
   getCommitWallet,
   sendTelegram,
 } from "../shared/queue.ts";
+import { log, redactSecrets } from "../shared/log.ts";
+import type { QueueStats } from "../shared/routes/health.ts";
 
 export type { QueueStatus, QueueItem };
 
@@ -82,6 +90,12 @@ export function initQueue(dbPath = "queue.db") {
   if (!columns.some((c) => c.name === "retryAfter")) {
     db.exec("ALTER TABLE create_queue ADD COLUMN retryAfter INTEGER NOT NULL DEFAULT 0");
   }
+
+  // Idempotency: resolve any pre-existing active duplicates, then enforce
+  // at-most-one-active-row per (rpId, credentialId). Order matters — dedupe must
+  // run before the unique index can build on a DB that already has duplicates.
+  db.prepare(DEDUPE_ACTIVE_DUPLICATES_SQL).run(Date.now());
+  db.exec(CREATE_ACTIVE_UNIQUE_INDEX);
 }
 
 export function getQueueDb(): Database {
@@ -101,20 +115,48 @@ export async function enqueue(params: {
   const id = crypto.randomUUID();
   const now = Date.now();
   const ipHash = await hashIp(params.ip);
-  db.prepare(`
-    INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
-    VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, params.rpId, params.credentialId, params.walletRef, params.publicKey, params.name, params.initialCredentialId, params.metadata, ipHash, now, now);
-  return id;
+  try {
+    db.prepare(`
+      INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt)
+      VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, params.rpId, params.credentialId, params.walletRef, params.publicKey, params.name, params.initialCredentialId, params.metadata, ipHash, now, now);
+    return id;
+  } catch (err) {
+    // Lost the race to a concurrent identical create — return the existing
+    // active row's id so the request is idempotent (same job, not a duplicate).
+    if (isUniqueConstraintError(err)) {
+      const existing = findDuplicate(params.rpId, params.credentialId);
+      if (existing && existing.status !== "failed") {
+        log.info("enqueue deduplicated to existing active job", { job_id: existing.id, operation: "enqueue" });
+        return existing.id;
+      }
+    }
+    throw err;
+  }
 }
 
 export function getQueueItem(id: string): QueueItem | null {
   return (db.prepare("SELECT * FROM create_queue WHERE id = ?").get(id) as unknown as QueueItem | undefined) ?? null;
 }
 
+/** Cheap single indexed COUNT of active items — for the create backpressure gate. */
+export function getActiveQueueDepth(): number {
+  return (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").get() as unknown as { c: number }).c;
+}
+
+/** Queue health snapshot for /api/health (3 fields). */
+export function getQueueStats(): QueueStats {
+  const depth = (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')").get() as unknown as { c: number }).c;
+  const dlq = (db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE status = 'failed'").get() as unknown as { c: number }).c;
+  const oldest = (db.prepare("SELECT MIN(createdAt) as m FROM create_queue WHERE status IN ('pending','committed','creating')").get() as unknown as { m: number | null }).m;
+  return { queueDepth: depth, dlqCount: dlq, oldestActiveAgeMs: oldest ? Date.now() - oldest : 0 };
+}
+
 export function findDuplicate(rpId: string, credentialId: string): QueueItem | null {
+  // Prefer the ACTIVE row over a 'failed' (DLQ) one for the same key — a stale
+  // failed attempt must never shadow a live in-progress job. Deterministic ties.
   return (db.prepare(
-    "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY createdAt DESC LIMIT 1"
+    "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
   ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
 }
 
@@ -190,13 +232,27 @@ async function checkAlerts(): Promise<void> {
 // --- Worker ---
 
 let workerRunning = false;
+let cycleStartedAt = 0;
+let lastStuckWarnAt = 0;
+const STUCK_CYCLE_MS = 3 * 60_000;
 
 export function startQueueWorker() {
   console.log("[queue] Worker started, interval: 60s");
   ensureCommitWalletFunded().catch(() => {});
   setInterval(() => {
-    if (workerRunning) return;
-    processQueue().catch((err) => console.error("[queue] Worker error:", err));
+    if (workerRunning) {
+      // Single-flight: a tick is skipped while a cycle runs. Every individual
+      // await is timeout-bounded so a cycle cannot hang forever, but a pathologically
+      // slow one is worth surfacing (rate-limited) so operators can spot a stall.
+      const age = Date.now() - cycleStartedAt;
+      if (age > STUCK_CYCLE_MS && Date.now() - lastStuckWarnAt > STUCK_CYCLE_MS) {
+        lastStuckWarnAt = Date.now();
+        log.warn("queue cycle still running — possible stall", { operation: "processQueue", outcome: "stuck", cycle_age_ms: age });
+      }
+      return;
+    }
+    cycleStartedAt = Date.now();
+    processQueue().catch((err) => log.error("queue worker cycle error", { operation: "processQueue", error: String(err) }));
   }, WORKER_INTERVAL);
 }
 
@@ -275,7 +331,11 @@ async function processQueue() {
   }
 }
 
-// Phase 1: Verify items in 'creating' status
+// Phase 1: Reconcile any item left in the legacy 'creating' status.
+// The current flow goes committed→done directly (processCommitted), so no NEW
+// item enters 'creating'. This is retained ON PURPOSE as a safety net: during a
+// rolling upgrade an in-flight row written by an older build could be 'creating',
+// and this confirms it on-chain (→ done) or fails it out — never stranded.
 async function processCreating() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
@@ -371,8 +431,10 @@ async function processCommitted() {
         } else {
           const COMMIT_COOLDOWN = 2 * 60_000;
           if (Date.now() - item.updatedAt >= COMMIT_COOLDOWN) {
-            db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-            console.warn(`[queue] Item ${item.id} commitment missing after ${COMMIT_COOLDOWN / 1000}s, resetting to pending`);
+            // Commitment never landed — re-commit, but THROUGH handleFailure so
+            // retries/retryAfter advance. Otherwise an item whose commit never
+            // confirms oscillates committed↔pending forever with no progress.
+            handleFailure(item, "commitment missing after cooldown, re-committing", "pending");
           }
         }
       }
@@ -383,8 +445,16 @@ async function processCommitted() {
 
   const { wallet, client: walletClient } = getCreateWallet(cfg());
 
-  for (let offset = 0; offset < ready.length; offset += CREATE_SUB_BATCH) {
-    const batch = ready.slice(offset, offset + CREATE_SUB_BATCH);
+  // Reconciliation: some 'ready' items may already be on-chain — a prior
+  // createRecord landed but our receipt wait timed out, or the record was
+  // created out of band. Re-sending those would revert the WHOLE batch
+  // (RecordAlreadyExists). Mark already-present ones done and submit only the
+  // genuinely-missing ones.
+  const missing = await reconcileReady(walletClient, ready);
+  if (missing.length === 0) return;
+
+  for (let offset = 0; offset < missing.length; offset += CREATE_SUB_BATCH) {
+    const batch = missing.slice(offset, offset + CREATE_SUB_BATCH);
     const params = batch.map((item) => {
       const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
       return {
@@ -407,7 +477,6 @@ async function processCommitted() {
         args: [CONTRACT_ADDRESS, params],
         account: wallet.account,
       });
-      console.log(`[queue] batchCreateRecord: ${batch.length} items, estimated gas: ${gasEstimate}`);
 
       const hash = await wallet.writeContract({
         address: BATCH_HELPER_ADDRESS,
@@ -427,12 +496,122 @@ async function processCommitted() {
         db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
           .run(hash, now, item.id);
       }
-      console.log(`[queue] batchCreateRecord: ${batch.length} items confirmed, done`);
+      log.info("batchCreateRecord confirmed", { operation: "batchCreateRecord", count: batch.length, outcome: "success" });
     } catch (err) {
       handle.release();
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[queue] batchCreateRecord failed (${batch.length} items): ${msg.slice(0, 200)}`);
-      break;
+      const msg = shortMsg(err);
+      if (batchFailureAction(err) === "retry-transient") {
+        // The whole batch is fine — an RPC/gas hiccup. Back each item off and
+        // stop this cycle; they retry (with backoff) on a later cycle.
+        for (const item of batch) handleFailure(item, `batchCreateRecord: ${msg}`, "committed");
+        log.warn("batchCreateRecord transient failure, backing off", { operation: "batchCreateRecord", count: batch.length, error_category: "transient" });
+        break;
+      }
+      // Deterministic revert → at least one poison item. Isolate it so it can
+      // never again block the innocent items in this (or any) batch.
+      log.warn("batchCreateRecord poison batch, isolating", { operation: "batchCreateRecord", count: batch.length, error_category: "poison" });
+      await isolatePoisonCreate(walletClient, wallet, batch);
+      // Do NOT break — let subsequent sub-batches proceed.
+    }
+  }
+}
+
+/**
+ * For each 'ready' item, mark those already on-chain as done; return the rest.
+ * If the reconciliation read itself fails, fall back to the full set (the next
+ * cycle re-reconciles) — never lose items.
+ */
+async function reconcileReady(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+  items: QueueItem[],
+): Promise<QueueItem[]> {
+  const calls = items.map((item) => ({
+    address: CONTRACT_ADDRESS as `0x${string}`,
+    abi: CONTRACT_ABI,
+    functionName: "hasRecord" as const,
+    args: [item.rpId, item.credentialId] as const,
+  }));
+  let results;
+  try {
+    results = await client.multicall({ contracts: calls });
+  } catch (err) {
+    log.warn("reconcileReady multicall failed, retrying full set next cycle", { operation: "hasRecord", error_category: "transient", error: shortMsg(err) });
+    return items;
+  }
+  const { present, missing } = splitByHasRecord(items, results);
+  if (present.length > 0) {
+    for (const item of present) markItemDone(item);
+    log.info("reconciled already-on-chain items to done", { operation: "reconcile", count: present.length, outcome: "success" });
+  }
+  return missing;
+}
+
+/**
+ * Poison isolation for createRecord: process each item INDIVIDUALLY so the batch
+ * always makes forward progress, even when items conflict with EACH OTHER
+ * (e.g. two credentials sharing a walletRef — the contract allows only one).
+ *
+ * Per item, in order: already on-chain → done; else estimate+send a single-item
+ * tx. Estimates/sends are sequential, so once item A lands, item B's fresh
+ * estimate (or send) reverts (WalletRefAlreadyExists) and B is quarantined.
+ * Every item ends done / quarantined / transient-backoff — never livelocked.
+ */
+async function isolatePoisonCreate(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+  // deno-lint-ignore no-explicit-any
+  wallet: any,
+  items: QueueItem[],
+): Promise<void> {
+  for (const item of items) {
+    try {
+      const has = await client.readContract({
+        address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, functionName: "hasRecord", args: [item.rpId, item.credentialId],
+      });
+      if (has) { markItemDone(item); continue; }
+    } catch { /* fall through to per-item submit */ }
+
+    const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
+    const param = {
+      rpId: item.rpId, credentialId: item.credentialId, walletRef: walletRefHex,
+      publicKey: publicKeyHex, name: item.name, initialCredentialId: item.initialCredentialId, metadata: metadataHex,
+    };
+
+    // 1. Fresh estimate (reflects any sibling we just sent this pass).
+    let gasEstimate: bigint;
+    try {
+      gasEstimate = await client.estimateContractGas({
+        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
+        args: [CONTRACT_ADDRESS, [param]], account: wallet.account,
+      });
+    } catch (err) {
+      if (batchFailureAction(err) === "isolate-poison") {
+        handleFailure(item, `batchCreateRecord poison: ${shortMsg(err)}`, "committed", { poison: true });
+      } else {
+        handleFailure(item, `batchCreateRecord transient during isolation: ${shortMsg(err)}`, "committed");
+      }
+      continue;
+    }
+
+    // 2. Submit this item alone, wait the receipt, verify it didn't revert.
+    const handle = await acquireNonce("create");
+    try {
+      const hash = await wallet.writeContract({
+        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
+        args: [CONTRACT_ADDRESS, [param]], nonce: handle.nonce, gas: gasEstimate * 120n / 100n,
+      });
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      if (receipt.status === "reverted") throw new Error(`reverted: ${hash}`);
+      markItemDone(item, hash);
+      log.info("isolated item created individually", { job_id: item.id, operation: "batchCreateRecord", outcome: "success" });
+    } catch (err) {
+      handle.release();
+      if (batchFailureAction(err) === "isolate-poison") {
+        handleFailure(item, `batchCreateRecord poison (individual send): ${shortMsg(err)}`, "committed", { poison: true });
+      } else {
+        handleFailure(item, `batchCreateRecord transient (individual send): ${shortMsg(err)}`, "committed");
+      }
     }
   }
 }
@@ -474,34 +653,102 @@ async function processPending() {
     for (const item of items) {
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
     }
-    console.log(`[queue] batchCommit: ${items.length} items confirmed`);
+    log.info("batchCommit confirmed", { operation: "batchCommit", count: items.length, outcome: "success" });
   } catch (err) {
     handle.release();
-    console.warn(`[queue] batchCommit failed: ${err instanceof Error ? err.message : err}`);
+    const msg = shortMsg(err);
+    if (batchFailureAction(err) === "retry-transient") {
+      for (const item of items) handleFailure(item, `batchCommit: ${msg}`, "pending");
+      log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items.length, error_category: "transient" });
+    } else {
+      log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items.length, error_category: "poison" });
+      await isolatePoisonCommit(commitClient, wallet, items);
+    }
+  }
+}
+
+/**
+ * Poison isolation for batchCommit: re-estimate each commitment individually;
+ * quarantine the item(s) that deterministically revert, leave the rest 'pending'
+ * to be re-batched cleanly next cycle.
+ */
+async function isolatePoisonCommit(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+  // deno-lint-ignore no-explicit-any
+  wallet: any,
+  items: QueueItem[],
+): Promise<void> {
+  for (const item of items) {
+    const { commitment } = buildCommitment(item);
+    try {
+      await client.estimateContractGas({
+        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCommit",
+        args: [CONTRACT_ADDRESS, [commitment]], account: wallet.account,
+      });
+      // Estimable individually → innocent; leave 'pending' for next cycle.
+    } catch (err) {
+      if (batchFailureAction(err) === "isolate-poison") {
+        handleFailure(item, `batchCommit poison: ${shortMsg(err)}`, "pending", { poison: true });
+      } else {
+        handleFailure(item, `batchCommit transient during isolation: ${shortMsg(err)}`, "pending");
+      }
+    }
   }
 }
 
 const FAILURE_ALERT_BATCH = 10;
 let failuresSinceLastAlert = 0;
 
-function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | "committed" = "pending") {
+/**
+ * Record a queue item failure.
+ * - poison (deterministic): quarantine immediately to 'failed' (the DLQ) — no
+ *   retry, prefixed "POISON:" so operators know it needs a code/data fix.
+ * - transient: schedule a backed-off retry; after MAX_RETRIES give up with
+ *   "EXHAUSTED:". Either way the item never blocks the rest of the queue.
+ */
+function handleFailure(
+  item: QueueItem,
+  error: string,
+  retryStatus: "pending" | "committed" = "pending",
+  opts?: { poison?: boolean },
+) {
   const retries = item.retries + 1;
-  if (retries >= MAX_RETRIES) {
+  const terminal = opts?.poison || retries >= MAX_RETRIES;
+  if (terminal) {
+    const prefix = opts?.poison ? "POISON" : "EXHAUSTED";
     db.prepare("UPDATE create_queue SET status = 'failed', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
-      .run(error, retries, Date.now(), item.id);
-    console.error(`[queue] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
+      .run(`${prefix}: ${error}`, retries, Date.now(), item.id);
+    log.error("queue item quarantined to DLQ", {
+      job_id: item.id, operation: "tx", outcome: opts?.poison ? "poison" : "exhausted",
+      error_category: opts?.poison ? "poison" : "transient", retries,
+    });
   } else {
-    const delay = Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
+    const delay = retryDelayMs(retries);
     const retryAfter = Date.now() + delay;
     db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
       .run(retryStatus, error, retries, retryAfter, Date.now(), item.id);
-    console.warn(`[queue] Item ${item.id} failed (retry ${retries}/${MAX_RETRIES}, next in ${delay / 1000}s, reset to ${retryStatus}): ${error}`);
+    log.warn("queue item retry scheduled", {
+      job_id: item.id, operation: "tx", outcome: "retry", attempt: retries,
+      error_category: "transient", next_retry_in_s: Math.round(delay / 1000),
+    });
   }
 
   failuresSinceLastAlert++;
   if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
     const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
-    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
+    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${failuresSinceLastAlert} tx failures since last alert\nTotal in DLQ (failed): ${failed}\nLatest error: ${error}`);
     failuresSinceLastAlert = 0;
   }
+}
+
+function shortMsg(err: unknown): string {
+  // Redact any embedded RPC credentials before this string is stored in the
+  // queue 'error' column (surfaced to operators / the status endpoint) or logged.
+  return redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
+}
+
+function markItemDone(item: QueueItem, txHash = ""): void {
+  db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
+    .run(txHash || item.txHash || "", Date.now(), item.id);
 }
