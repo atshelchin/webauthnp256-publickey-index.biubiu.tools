@@ -18,7 +18,11 @@
 | `QUEUE_DB_PATH` | 否(默认 queue.db) | SQLite 队列文件路径 |
 | `PRIVATE_KEY` | 写路径必填 | 服务钱包私钥(需持有 xDAI 付 gas)。**缺失时服务仍能启动**:读接口正常,create 会入队但后台不处理 |
 | `ALCHEMY_API_KEY` | 否 | 配置后作为优先写 RPC(Deno 已接线;CF 接线为本次接管补齐) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 否 | 告警通道,缺失则静默跳过 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 强烈建议 | 全部运营告警走此通道(见 06 矩阵);投递失败会记日志 |
+| `CACHE_MAX_MB` | 否(默认 32;CF 默认 8) | 内存缓存预算 |
+| `GLOBAL_WRITE_LIMIT` | 否(默认 40/分) | 全局创建上限(匹配排空速率) |
+| `LOG_LEVEL` | 否(默认 debug) | debug/info/warn/error |
+| `RUN_LIVE_TESTS` / `RUN_PERF` | 测试用 | 解锁触网/性能测试(默认套件全离线) |
 
 **警告**:`.env` 含真实私钥,已在 `.gitignore`,不要提交、不要打印。
 
@@ -27,7 +31,7 @@
 ```bash
 # Deno 侧
 deno task dev        # 热重载开发(--env 自动加载 .env)
-deno task test       # 168 通过 / 0 失败 / 5 忽略(链上 e2e 被 PRIVATE_KEY 门控跳过),约 30s
+deno task test       # 全离线套件(触网/perf/链上测试均门控忽略),约 17s
 deno task build      # README→HTML + deno compile → dist/webauthnp256-publickey-index(约 300MB)
 deno check deno/index.ts build.ts scripts/deploy.ts   # 类型检查(worker/ 需 CF 类型,由 vitest 侧覆盖)
 deno lint            # 目前 3 个 require-await 提示(均在测试文件,无碍)
