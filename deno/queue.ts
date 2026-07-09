@@ -12,9 +12,6 @@ import {
   GAS_BALANCE_THRESHOLD,
   FUND_THRESHOLD,
   FUND_AMOUNT,
-  CREATE_QUEUE_DDL,
-  CREATE_ACTIVE_UNIQUE_INDEX,
-  DEDUPE_ACTIVE_DUPLICATES_SQL,
   GLOBAL_WRITE_WINDOW,
   DEFAULT_GLOBAL_WRITE_LIMIT,
   isUniqueConstraintError,
@@ -23,7 +20,8 @@ import {
   getCommitWallet,
   sendTelegram,
 } from "../shared/queue.ts";
-import { runQueueCycle, type QueueStore } from "../shared/queue-engine.ts";
+import { runQueueCycle, type QueueStore, type AlertReason, type ItemFailureInfo } from "../shared/queue-engine.ts";
+import { runMigrations, type SqlRunner } from "../shared/migrations.ts";
 import { createViemChainOps } from "../shared/chain-viem.ts";
 import { log, redactSecrets } from "../shared/log.ts";
 import type { QueueStats } from "../shared/routes/health.ts";
@@ -65,29 +63,26 @@ setInterval(() => {
 
 let db: Database;
 
-export function initQueue(dbPath = "queue.db") {
+export async function initQueue(dbPath = "queue.db"): Promise<void> {
   db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
-  db.exec(CREATE_QUEUE_DDL);
-  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_created ON create_queue(createdAt)"); // global write-rate cap
-
-  // Migrations for existing databases
-  const columns = db.prepare("PRAGMA table_info(create_queue)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "walletRef")) {
-    db.exec("ALTER TABLE create_queue ADD COLUMN walletRef TEXT NOT NULL DEFAULT ''");
-  }
-  if (!columns.some((c) => c.name === "retryAfter")) {
-    db.exec("ALTER TABLE create_queue ADD COLUMN retryAfter INTEGER NOT NULL DEFAULT 0");
-  }
-
-  // Idempotency: resolve any pre-existing active duplicates, then enforce
-  // at-most-one-active-row per (rpId, credentialId). Order matters — dedupe must
-  // run before the unique index can build on a DB that already has duplicates.
-  db.prepare(DEDUPE_ACTIVE_DUPLICATES_SQL).run(Date.now());
-  db.exec(CREATE_ACTIVE_UNIQUE_INDEX);
+  // Versioned, shared migrations (shared/migrations.ts) — one numbered list
+  // for both runtimes; idempotent against legacy pre-versioning databases.
+  const runner: SqlRunner = {
+    // deno-lint-ignore require-await
+    async run(sql, params) {
+      if (params && params.length > 0) db.prepare(sql).run(...(params as (string | number)[]));
+      else db.exec(sql);
+    },
+    // deno-lint-ignore require-await
+    async scalar(sql) {
+      const row = db.prepare(sql).get() as Record<string, unknown> | undefined;
+      if (!row) return undefined;
+      const v = Object.values(row)[0];
+      return v == null ? undefined : Number(v);
+    },
+  };
+  await runMigrations(runner, Date.now());
 }
 
 export function getQueueDb(): Database {
@@ -137,10 +132,12 @@ export function getActiveQueueDepth(): number {
 }
 
 let GLOBAL_WRITE_LIMIT = DEFAULT_GLOBAL_WRITE_LIMIT;
-/** Override the global write cap (for testing only). */
-export function _setGlobalWriteLimitForTest(limit: number): void {
-  GLOBAL_WRITE_LIMIT = limit;
+/** Set the global write cap (env-driven at startup; also used by tests). */
+export function setGlobalWriteLimit(limit: number): void {
+  if (Number.isFinite(limit) && limit > 0) GLOBAL_WRITE_LIMIT = limit;
 }
+/** Test alias. */
+export const _setGlobalWriteLimitForTest = setGlobalWriteLimit;
 
 /** True when the GLOBAL create rate (across all clients) is at the cap — bounds gas burn. */
 export function globalWriteLimitExceeded(): boolean {
@@ -163,6 +160,13 @@ export function findDuplicate(rpId: string, credentialId: string): QueueItem | n
   return (db.prepare(
     "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
   ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
+}
+
+/** Queue lookup by walletRef — the query-by-walletRef path's local fallback. */
+export function findDuplicateByWalletRef(walletRef: string): QueueItem | null {
+  return (db.prepare(
+    "SELECT * FROM create_queue WHERE walletRef = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
+  ).get(walletRef) as unknown as QueueItem | undefined) ?? null;
 }
 
 // --- Engine wiring: SQLite QueueStore + viem ChainOps ---
@@ -227,6 +231,20 @@ const sqliteStore: QueueStore = {
     db.prepare("DELETE FROM create_queue WHERE status = 'failed' AND updatedAt < ?").run(failedBefore);
     return { doneDeleted: (result as unknown as { changes: number }).changes };
   },
+  // deno-lint-ignore require-await
+  async recordPendingTx(role, nonce, hash, sentAt, attempts = 0): Promise<void> {
+    db.prepare("INSERT OR REPLACE INTO pending_txs (role, nonce, hash, sentAt, attempts) VALUES (?, ?, ?, ?, ?)")
+      .run(role, nonce, hash, sentAt, attempts);
+  },
+  // deno-lint-ignore require-await
+  async deletePendingTx(role, nonce): Promise<void> {
+    db.prepare("DELETE FROM pending_txs WHERE role = ? AND nonce = ?").run(role, nonce);
+  },
+  // deno-lint-ignore require-await
+  async listPendingTxs(sentBefore) {
+    return db.prepare("SELECT role, nonce, hash, sentAt, attempts FROM pending_txs WHERE sentAt < ? ORDER BY nonce ASC")
+      .all(sentBefore) as unknown as { role: "create" | "commit"; nonce: number; hash: `0x${string}`; sentAt: number; attempts: number }[];
+  },
 };
 
 const chainOps = createViemChainOps(cfg);
@@ -283,7 +301,8 @@ async function checkAlerts(): Promise<void> {
       const commitBalance = await client.getBalance({ address: commitWallet.account.address });
       const commitBalanceXdai = Number(commitBalance) / 1e18;
       if (commitBalanceXdai < FUND_THRESHOLD) {
-        await ensureCommitWalletFunded();
+        const fundingIssue = await ensureCommitWalletFunded();
+        if (fundingIssue) alerts.push(fundingIssue);
       }
     }
   } catch (err) { console.warn(`[queue] checkAlerts gas/balance check failed:`, shortMsg(err)); }
@@ -296,12 +315,29 @@ async function checkAlerts(): Promise<void> {
 const FAILURE_ALERT_BATCH = 10;
 let failuresSinceLastAlert = 0;
 
-/**
- * Engine hook: batched operator alert for item failures. Mirrors the
- * pre-refactor handleFailure side-effect — the DB bookkeeping itself now
- * lives in shared/queue-engine.ts.
- */
-function onItemFailure(error: string): void {
+// Terminal (DLQ) quarantines mean a user's create WILL NOT complete without a
+// developer: POISON = code/data bug, EXHAUSTED = outage outlived all retries.
+// Per the operator's standing requirement these page IMMEDIATELY via Telegram
+// (throttled to one aggregate message per minute so a poison batch doesn't spam).
+const TERMINAL_ALERT_THROTTLE = 60_000;
+let lastTerminalAlertAt = 0;
+let terminalSinceLastAlert = 0;
+let lastTerminalError = "";
+
+function onItemFailure(error: string, info: ItemFailureInfo): void {
+  if (info.terminal) {
+    terminalSinceLastAlert++;
+    lastTerminalError = `${info.poison ? "POISON" : "EXHAUSTED"} (job ${info.jobId}): ${error}`;
+    const now = Date.now();
+    if (now - lastTerminalAlertAt >= TERMINAL_ALERT_THROTTLE) {
+      lastTerminalAlertAt = now;
+      const n = terminalSinceLastAlert;
+      terminalSinceLastAlert = 0;
+      const kind = info.poison ? "code/data bug" : "outage exhausted retries";
+      sendTelegram(cfg(), `🚨 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${n} create request(s) QUARANTINED to DLQ — developer intervention required (${kind}).\nLatest: ${lastTerminalError}\nReplay after fixing: see 06-operations-runbook.md`);
+    }
+    return;
+  }
   failuresSinceLastAlert++;
   if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
     const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
@@ -310,16 +346,58 @@ function onItemFailure(error: string): void {
   }
 }
 
+// Consecutive gas-check failures = the write RPC face is unreachable and NO
+// creates are progressing. checkAlerts() covers backlog/balance, but the root
+// cause deserves its own explicit page after a few cycles (~3 min).
+const RPC_UNREACHABLE_THRESHOLD = 3;
+const RPC_UNREACHABLE_THROTTLE = 5 * 60_000;
+let consecutiveGasFails = 0;
+let lastRpcUnreachableAlertAt = 0;
+
+async function flushTerminalAlerts(): Promise<void> {
+  // A single throttled terminal quarantine (a lone POISON within the 60s
+  // window right after a prior page) would otherwise never be reported. Flush
+  // any accumulated count on the periodic alert sweep so nothing is lost.
+  if (terminalSinceLastAlert > 0 && Date.now() - lastTerminalAlertAt >= TERMINAL_ALERT_THROTTLE) {
+    lastTerminalAlertAt = Date.now();
+    const n = terminalSinceLastAlert;
+    terminalSinceLastAlert = 0;
+    await sendTelegram(cfg(), `🚨 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${n} create request(s) QUARANTINED to DLQ — developer intervention required.\nLatest: ${lastTerminalError}\nReplay after fixing: see 06-operations-runbook.md`);
+  }
+}
+
+async function onCheckAlerts(gasPriceGwei: number | undefined, reason: AlertReason): Promise<void> {
+  await flushTerminalAlerts();
+  if (reason === "gas-fail") {
+    consecutiveGasFails++;
+    if (consecutiveGasFails >= RPC_UNREACHABLE_THRESHOLD && Date.now() - lastRpcUnreachableAlertAt >= RPC_UNREACHABLE_THROTTLE) {
+      lastRpcUnreachableAlertAt = Date.now();
+      const depth = getActiveQueueDepth();
+      await sendTelegram(cfg(), `🔌 [webauthnp256-publickey-index] [Deno] [Gnosis]\nWrite RPC unreachable for ${consecutiveGasFails} consecutive cycles — creates are NOT being processed (${depth} queued). Endpoints are rotating automatically; if this persists, check RPC providers / ALCHEMY_API_KEY.`);
+    }
+  } else {
+    consecutiveGasFails = 0;
+  }
+  void gasPriceGwei; // Deno's checkAlerts measures gas itself
+  await checkAlerts();
+}
+
 // --- Worker ---
 
 let workerRunning = false;
+let consecutiveCycleErrors = 0;
+let lastCycleErrorAlertAt = 0;
 let cycleStartedAt = 0;
 let lastStuckWarnAt = 0;
 const STUCK_CYCLE_MS = 3 * 60_000;
 
 export function startQueueWorker() {
   console.log("[queue] Worker started, interval: 60s");
-  ensureCommitWalletFunded().catch(() => {});
+  ensureCommitWalletFunded()
+    .then((issue) => {
+      if (issue) return sendTelegram(cfg(), `[webauthnp256-publickey-index] [Deno] [Gnosis]\n${issue}`);
+    })
+    .catch(() => {});
   setInterval(() => {
     if (workerRunning) {
       // Single-flight: a tick is skipped while a cycle runs. Every individual
@@ -329,32 +407,51 @@ export function startQueueWorker() {
       if (age > STUCK_CYCLE_MS && Date.now() - lastStuckWarnAt > STUCK_CYCLE_MS) {
         lastStuckWarnAt = Date.now();
         log.warn("queue cycle still running — possible stall", { operation: "processQueue", outcome: "stuck", cycle_age_ms: age });
+        // A stalled worker means user creates silently stop progressing —
+        // that's a dev-intervention condition, so it must reach Telegram.
+        sendTelegram(cfg(), `[webauthnp256-publickey-index] [Deno] [Gnosis]\n🛑 Queue cycle stuck for ${Math.round(age / 60_000)}min — creates are NOT being processed. Restart / investigate.`);
       }
       return;
     }
     cycleStartedAt = Date.now();
-    processQueue().catch((err) => log.error("queue worker cycle error", { operation: "processQueue", error: String(err) }));
+    processQueue().then(() => { consecutiveCycleErrors = 0; }).catch((err) => {
+      log.error("queue worker cycle error", { operation: "processQueue", error: shortMsg(err) });
+      // A cycle that THROWS never reaches checkAlerts — so persistent cycle
+      // failures (a bug, a broken migration, D1 down) would go dark. Page after
+      // a few consecutive ones so a stalled pipeline always reaches Telegram.
+      consecutiveCycleErrors++;
+      if (consecutiveCycleErrors >= 3 && Date.now() - lastCycleErrorAlertAt >= 5 * 60_000) {
+        lastCycleErrorAlertAt = Date.now();
+        sendTelegram(cfg(), `🛑 [webauthnp256-publickey-index] [Deno] [Gnosis]\nQueue cycle FAILING (${consecutiveCycleErrors} consecutive errors) — creates are NOT being processed.\nLatest: ${shortMsg(err)}`);
+      }
+    });
   }, WORKER_INTERVAL);
 }
 
-async function ensureCommitWalletFunded(): Promise<void> {
+/**
+ * Top up the commit wallet from the create wallet when low. Returns an
+ * operator-actionable alert string when developer intervention is required
+ * (top-up needed / funding failing) so callers can push it to Telegram —
+ * "needs money" must never be console-only.
+ */
+async function ensureCommitWalletFunded(): Promise<string | null> {
   try {
     const { wallet: createWallet, client } = getCreateWallet(cfg());
     const { wallet: commitWallet } = getCommitWallet(cfg());
-    if (commitWallet.account.address === createWallet.account.address) return;
+    if (commitWallet.account.address === createWallet.account.address) return null;
 
     const commitBalance = await client.getBalance({ address: commitWallet.account.address });
     const commitBalanceXdai = Number(commitBalance) / 1e18;
     if (commitBalanceXdai >= FUND_THRESHOLD) {
       console.log(`[queue] Commit wallet ${commitWallet.account.address} balance: ${commitBalanceXdai.toFixed(6)} xDAI (ok)`);
-      return;
+      return null;
     }
 
     const mainBalance = await client.getBalance({ address: createWallet.account.address });
     const mainBalanceXdai = Number(mainBalance) / 1e18;
     if (mainBalanceXdai < FUND_AMOUNT + GAS_BALANCE_THRESHOLD) {
       console.warn(`[queue] Cannot fund commit wallet: main balance too low (${mainBalanceXdai.toFixed(6)} xDAI)`);
-      return;
+      return `🪫 TOP-UP REQUIRED: cannot auto-fund commit wallet — create wallet ${createWallet.account.address} has only ${mainBalanceXdai.toFixed(6)} xDAI (needs ≥ ${(FUND_AMOUNT + GAS_BALANCE_THRESHOLD).toFixed(3)}). Creates will stall when it runs out.`;
     }
 
     console.log(`[queue] Funding commit wallet ${commitWallet.account.address}: ${commitBalanceXdai.toFixed(6)} → +${FUND_AMOUNT} xDAI`);
@@ -367,9 +464,24 @@ async function ensureCommitWalletFunded(): Promise<void> {
       throw new Error(`Fund tx reverted: ${hash}`);
     }
     console.log(`[queue] Commit wallet funded: ${hash}`);
+    return null;
   } catch (err) {
     console.warn(`[queue] Auto-fund failed:`, shortMsg(err));
+    return `⚠️ Commit wallet auto-fund FAILED: ${shortMsg(err)} — check wallet balances / RPC.`;
   }
+}
+
+/**
+ * Resolve once the current queue cycle (if any) finishes, or after timeoutMs.
+ * Used by graceful shutdown so a mid-broadcast batch isn't killed.
+ */
+export async function waitForQueueIdle(timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (workerRunning) {
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return true;
 }
 
 async function processQueue() {
@@ -382,7 +494,9 @@ async function processQueue() {
       nonces: { acquire: (role) => acquireNonce(role) },
       hooks: {
         onItemFailure,
-        checkAlerts: (_gasPriceGwei?: number) => checkAlerts(),
+        checkAlerts: onCheckAlerts,
+        onStuckTx: (role, nonce, attempts, ageMs) =>
+          sendTelegram(cfg(), `🧵 [webauthnp256-publickey-index] [Deno] [Gnosis]\nWallet nonce STUCK: role=${role} nonce=${nonce} not clearing after ${attempts} replacement attempts (${Math.round(ageMs / 60_000)}min). Every create behind it is blocked — check RPC acceptance / raise MAX_GAS_PRICE_GWEI.`),
       },
       label: "[queue]",
     });

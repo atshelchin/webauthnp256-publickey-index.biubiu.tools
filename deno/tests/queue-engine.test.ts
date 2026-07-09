@@ -14,6 +14,8 @@ import {
   type ChainOps,
   type BatchCreateParam,
   type QueueEngineDeps,
+  type AlertReason,
+  type ItemFailureInfo,
 } from "../../shared/queue-engine.ts";
 import type { QueueItem, CallResult } from "../../shared/queue.ts";
 import type { NonceHandle, NonceRole } from "../../shared/nonce.ts";
@@ -115,6 +117,20 @@ class FakeStore implements QueueStore {
     this.rows = this.rows.filter((r) => !(r.status === "failed" && r.updatedAt < failedBefore));
     return { doneDeleted };
   }
+  pendingTxs: { role: NonceRole; nonce: number; hash: `0x${string}`; sentAt: number; attempts: number }[] = [];
+  // deno-lint-ignore require-await
+  async recordPendingTx(role: NonceRole, nonce: number, hash: string, sentAt: number, attempts = 0): Promise<void> {
+    this.pendingTxs = this.pendingTxs.filter((t) => !(t.role === role && t.nonce === nonce));
+    this.pendingTxs.push({ role, nonce, hash: hash as `0x${string}`, sentAt, attempts });
+  }
+  // deno-lint-ignore require-await
+  async deletePendingTx(role: NonceRole, nonce: number): Promise<void> {
+    this.pendingTxs = this.pendingTxs.filter((t) => !(t.role === role && t.nonce === nonce));
+  }
+  // deno-lint-ignore require-await
+  async listPendingTxs(sentBefore: number) {
+    return this.pendingTxs.filter((t) => t.sentAt < sentBefore).sort((a, b) => a.nonce - b.nonce);
+  }
 }
 
 type Resp<T> = { ok: T } | { err: unknown };
@@ -191,6 +207,14 @@ class FakeChain implements ChainOps {
   async waitReceipt(hash: `0x${string}`, _timeoutMs: number, _role: NonceRole): Promise<{ status: "success" | "reverted" }> {
     return this.take("waitReceipt", hash, () => ({ status: "success" as const }));
   }
+  // deno-lint-ignore require-await
+  async getConfirmedNonce(role: NonceRole): Promise<number> {
+    return this.take("getConfirmedNonce", role, () => 0);
+  }
+  // deno-lint-ignore require-await
+  async sendCancel(role: NonceRole, nonce: number, gasPrice: bigint): Promise<`0x${string}`> {
+    return this.take("sendCancel", { role, nonce, gasPrice }, () => `0xca${(++this.hashSeq).toString(16).padStart(2, "0")}` as `0x${string}`);
+  }
 }
 
 class FakeNonces {
@@ -209,22 +233,25 @@ function harness(rows: QueueItem[]) {
   const store = new FakeStore(rows);
   const chain = new FakeChain();
   const nonces = new FakeNonces();
-  const failures: string[] = [];
-  const alerts: (number | undefined)[] = [];
+  const failures: { error: string; info: ItemFailureInfo }[] = [];
+  const alerts: { g: number | undefined; reason: AlertReason }[] = [];
+  const stuckAlerts: { role: NonceRole; nonce: number; attempts: number }[] = [];
   let t = T0 + 10_000;
   const deps: QueueEngineDeps = {
     store,
     chain,
     nonces,
     hooks: {
-      onItemFailure: (e) => { failures.push(e); },
+      onItemFailure: (error, info) => { failures.push({ error, info }); },
       // deno-lint-ignore require-await
-      checkAlerts: async (g) => { alerts.push(g); },
+      checkAlerts: async (g, reason) => { alerts.push({ g, reason }); },
+      // deno-lint-ignore require-await
+      onStuckTx: async (role, nonce, attempts) => { stuckAlerts.push({ role, nonce, attempts }); },
     },
     now: () => t,
     label: "[test]",
   };
-  return { store, chain, nonces, failures, alerts, deps, setNow: (v: number) => { t = v; }, getNow: () => t };
+  return { store, chain, nonces, failures, alerts, stuckAlerts, deps, setNow: (v: number) => { t = v; }, getNow: () => t };
 }
 
 // TRANSIENT vs POISON errors, classified by shared/reliability.ts on rpc-write:
@@ -238,14 +265,16 @@ Deno.test("engine: empty queue → cleanup only, zero chain calls", async () => 
   await runQueueCycle(h.deps);
   assertEquals(h.chain.calls.length, 0, "no chain calls on an idle queue");
   assertEquals(h.store.rows.length, 0, "expired done row cleaned up");
-  assertEquals(h.alerts.length, 0, "no alert hook on the idle path");
+  // A drained wallet / growing DLQ must be discovered while the queue is QUIET,
+  // not hours later when the next user create arrives — idle cycles alert too.
+  assertEquals(h.alerts, [{ g: undefined, reason: "idle" }], "idle cycles still run the alert sweep");
 });
 
 Deno.test("engine: gas price above cap → pause cycle, alert with the measured price, no phases", async () => {
   const h = harness([mkItem({ status: "pending" })]);
   h.chain.push("getGasPrice", { ok: 200_000_000n }); // 0.2 gwei > 0.1 cap
   await runQueueCycle(h.deps);
-  assertEquals(h.alerts, [0.2], "checkAlerts receives the measured gwei");
+  assertEquals(h.alerts, [{ g: 0.2, reason: "gas-high" }], "checkAlerts receives the measured gwei");
   assertEquals(h.chain.called("getBlockNumber"), 0);
   assertEquals(h.chain.called("sendBatchCommit"), 0);
   assertEquals(h.store.row("item-" + seq).status, "pending", "item untouched");
@@ -256,7 +285,7 @@ Deno.test("engine: gas-price check FAILURE alerts before returning and skips pha
   h.chain.push("getGasPrice", { err: transientErr() });
   await runQueueCycle(h.deps);
   assertEquals(h.alerts.length, 1, "checkAlerts MUST run during the outage — this was the silent-stall bug");
-  assertEquals(h.alerts[0], undefined, "no gas price measured on the failure branch");
+  assertEquals(h.alerts[0], { g: undefined, reason: "gas-fail" }, "gas-fail reason lets runtimes page 'write RPC unreachable'");
   assertEquals(h.chain.called("sendBatchCommit"), 0, "no phase ran");
 });
 
@@ -291,6 +320,7 @@ Deno.test("engine: transient batchCommit failure → all items backed off as pen
   }
   assertEquals(h.nonces.released.length, 1, "failed send releases the nonce");
   assertEquals(h.failures.length, 2, "onItemFailure fired per item");
+  assertEquals(h.failures.every((f) => !f.info.terminal), true, "backed-off retries are not terminal");
 });
 
 Deno.test("engine: poison batchCommit → per-item isolation: innocent stays pending untouched, culprit → POISON DLQ", async () => {
@@ -309,6 +339,7 @@ Deno.test("engine: poison batchCommit → per-item isolation: innocent stays pen
   assertEquals(c.status, "failed");
   assert(c.error.startsWith("POISON: batchCommit poison: "), c.error);
   assertEquals(h.failures.length, 1, "only the culprit counted as a failure");
+  assertEquals(h.failures[0].info, { jobId: culprit.id, terminal: true, poison: true }, "POISON quarantine reports terminal+poison — runtimes page immediately");
 });
 
 Deno.test("engine: transient failure at retries=9 → EXHAUSTED to the DLQ", async () => {
@@ -670,4 +701,169 @@ Deno.test("engine: cleanup deletes done>7d and failed>30d, keeps boundary rows a
   await runQueueCycle(h.deps); // idle queue → cleanup-only path
   const ids = h.store.rows.map((r) => r.id).sort();
   assertEquals(ids, [doneBoundary.id, failedYoung.id].sort(), "8-day-old DLQ row kept — swapped retention windows would destroy poison triage");
+});
+
+
+// ── Stuck-tx unstick sweep (P2-4): one jammed nonce must never stall creates ──
+
+Deno.test("engine: successful send+receipt leaves NO pending-tx ledger row", async () => {
+  const item = mkItem({ status: "pending" });
+  const h = harness([item]);
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.pendingTxs, [], "record on send, delete on mined receipt");
+});
+
+Deno.test("engine: receipt timeout leaves the broadcast in the ledger for the sweep", async () => {
+  const item = mkItem({ status: "pending" });
+  const h = harness([item]);
+  h.chain.push("waitReceipt", { err: new Error("Timed out while waiting for transaction") });
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.pendingTxs.length, 1, "unconfirmed broadcast stays in the ledger");
+  assertEquals(h.store.pendingTxs[0].role, "commit");
+  assertEquals(h.store.pendingTxs[0].nonce, 100);
+});
+
+Deno.test("engine: sweep clears an aged broadcast whose nonce is already CONFIRMED (no cancel) — zombie-proof", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 }); // keep phases quiet
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "commit", nonce: 42, hash: "0xdead", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000); // aged past STUCK_TX_AGE
+  // Confirmed nonce is 43 → nonce 42 is consumed, regardless of which hash won.
+  h.chain.push("getConfirmedNonce", { ok: 43 });
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.pendingTxs, [], "consumed nonce row deleted (no dependence on the recorded hash)");
+  assertEquals(h.chain.called("sendCancel"), 0, "consumed → nothing to cancel");
+});
+
+Deno.test("engine: sweep REPLACES a genuinely-stuck nonce (>= confirmed) with a same-nonce cancel at 1.5x gas", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 7 }); // nonce 7 NOT yet confirmed → stuck
+  await runQueueCycle(h.deps);
+  const cancels = h.chain.calls.filter((c) => c.method === "sendCancel");
+  assertEquals(cancels.length, 1, "stuck nonce replaced");
+  const args = cancels[0].args as { role: NonceRole; nonce: number; gasPrice: bigint };
+  assertEquals(args.role, "create");
+  assertEquals(args.nonce, 7, "SAME nonce — replacement, not a new stacked tx");
+  assertEquals(args.gasPrice, 15_000_000n, "attempt 1 → 150% of the 0.01 gwei network price");
+  assertEquals(h.store.pendingTxs.length, 1, "the cancel is the tracked broadcast");
+  assert(h.store.pendingTxs[0].hash.startsWith("0xca"));
+  assertEquals(h.store.pendingTxs[0].attempts, 1, "attempt counter advanced");
+  assertEquals(h.store.pendingTxs[0].sentAt, h.getNow(), "age reset — next sweep re-checks");
+});
+
+Deno.test("engine: cancel gas ESCALATES with attempts (a persistent jam eventually clears)", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck", sentAt: T0, attempts: 2 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 7 });
+  await runQueueCycle(h.deps);
+  const args = h.chain.calls.filter((c) => c.method === "sendCancel")[0].args as { gasPrice: bigint };
+  // attempts becomes 3 → factor 150 + (3-1)*50 = 250% of 0.01 gwei = 25_000_000
+  assertEquals(args.gasPrice, 25_000_000n, "gas rises with each replacement attempt");
+});
+
+Deno.test("engine: cancel gas is CAPPED at MAX_GAS_PRICE_GWEI (never overpay past the operator ceiling)", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 7 });
+  // Network gas 0.09 gwei; 150% = 0.135 gwei would exceed the 0.1 gwei cap.
+  h.chain.push("getGasPrice", { ok: 90_000_000n });
+  await runQueueCycle(h.deps);
+  const args = h.chain.calls.filter((c) => c.method === "sendCancel")[0].args as { gasPrice: bigint };
+  assertEquals(args.gasPrice, 100_000_000n, "clamped to MAX_GAS_PRICE_GWEI (0.1 gwei)");
+});
+
+Deno.test("engine: a nonce that won't clear after many attempts PAGES the operator (onStuckTx)", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck", sentAt: T0, attempts: 4 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 7 });
+  await runQueueCycle(h.deps);
+  assertEquals(h.stuckAlerts.length, 1, "attempt 5 reaches the escalation threshold → Telegram");
+  assertEquals(h.stuckAlerts[0], { role: "create", nonce: 7, attempts: 5 });
+});
+
+Deno.test("engine: a persistently-REJECTED cancel still climbs attempts (keeps hash/age) so escalation eventually fires", async () => {
+  const stuckGuard = mkItem({ status: "pending" }); // ready item — phases must still run
+  const h = harness([stuckGuard]);
+  h.store.pendingTxs.push({ role: "commit", nonce: 3, hash: "0xstuck", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 3 }); // still pending
+  h.chain.push("sendCancel", { err: new Error("replacement transaction underpriced") });
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.pendingTxs[0].hash, "0xstuck", "original hash kept");
+  assertEquals(h.store.pendingTxs[0].sentAt, T0, "age preserved — not reset on failure");
+  assertEquals(h.store.pendingTxs[0].attempts, 1, "attempt counter climbs even when the cancel is REJECTED");
+  assertEquals(h.store.row(stuckGuard.id).status, "committed", "sweep failure never blocks the phases");
+});
+
+Deno.test("engine: a nonce stuck past the AGE threshold pages even if cancels keep bouncing", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 60 * 60_000 });
+  const h = harness([item]);
+  // attempts still low (cancels rejected), but stuck for >10min → age escalation.
+  h.store.pendingTxs.push({ role: "create", nonce: 4, hash: "0xstuck", sentAt: T0, attempts: 1 });
+  h.setNow(T0 + 12 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 4 });
+  h.chain.push("sendCancel", { err: new Error("replacement transaction underpriced") });
+  await runQueueCycle(h.deps);
+  assertEquals(h.stuckAlerts.length, 1, "age-based escalation fires regardless of accepted-cancel count");
+});
+
+Deno.test("engine: GAP FILL — a jammed nonce whose ledger row was lost is still cancelled (below an aged row)", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 60 * 60_000 });
+  const h = harness([item]);
+  // Confirmed nonce is 5; a row exists at 7 (aged) but 5 and 6 have NO rows
+  // (their record writes were lost). 5 and 6 are jamming 7 — fill them.
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck7", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 5 });
+  await runQueueCycle(h.deps);
+  const cancelledNonces = h.chain.calls.filter((c) => c.method === "sendCancel").map((c) => (c.args as { nonce: number }).nonce).sort((a, b) => a - b);
+  assertEquals(cancelledNonces, [5, 6, 7], "gap nonces 5 and 6 are synthesized and cancelled alongside the known row 7");
+});
+
+Deno.test("engine: sweep skips a role whose confirmed-nonce read fails (retries next cycle, nothing lost)", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "create", nonce: 7, hash: "0xstuck", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { err: transientErr() });
+  await runQueueCycle(h.deps);
+  assertEquals(h.chain.called("sendCancel"), 0, "no action without ground truth");
+  assertEquals(h.store.pendingTxs.length, 1, "row preserved for next cycle");
+});
+
+Deno.test("engine: fresh broadcasts (younger than the stuck age) are not swept", async () => {
+  const item = mkItem({ status: "pending", retryAfter: T0 + 10 * 60_000 });
+  const h = harness([item]);
+  h.store.pendingTxs.push({ role: "commit", nonce: 9, hash: "0xfresh", sentAt: T0 + 9_500, attempts: 0 });
+  // harness now = T0+10_000 → age 500ms < 2min
+  await runQueueCycle(h.deps);
+  assertEquals(h.chain.called("getConfirmedNonce"), 0, "too young to check");
+  assertEquals(h.store.pendingTxs[0].hash, "0xfresh");
+});
+
+Deno.test("engine: sweep runs even on an IDLE cycle (drained queue can still hold a jammed nonce)", async () => {
+  const h = harness([]); // no active items → idle path
+  h.store.pendingTxs.push({ role: "create", nonce: 5, hash: "0xstuck", sentAt: T0, attempts: 0 });
+  h.setNow(T0 + 5 * 60_000);
+  h.chain.push("getConfirmedNonce", { ok: 5 }); // still stuck
+  await runQueueCycle(h.deps);
+  assertEquals(h.chain.called("sendCancel"), 1, "idle does NOT mean a jam is ignored");
+  assertEquals(h.alerts.at(-1)?.reason, "idle", "idle alert sweep still runs after");
+});
+
+Deno.test("engine: a mined-but-REVERTED batch still clears its ledger row (nonce was consumed)", async () => {
+  const item = mkItem({ status: "committed" });
+  const h = harness([item]);
+  h.chain.push("waitReceipt", { ok: { status: "reverted" } }); // batch reverted → isolation converges it
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.pendingTxs, [], "reverted = mined = nonce consumed → nothing to unstick");
 });

@@ -22,11 +22,16 @@ export const HEALTH_OLDEST_JOB_DEGRADED_MS = 30 * 60_000; // 30 min stuck
 export const MAX_ACTIVE_QUEUE_DEPTH = 10_000;
 
 export function isDegraded(stats: QueueStats): boolean {
-  return (
-    stats.queueDepth >= HEALTH_QUEUE_DEPTH_DEGRADED ||
-    stats.dlqCount >= HEALTH_DLQ_DEGRADED ||
-    stats.oldestActiveAgeMs >= HEALTH_OLDEST_JOB_DEGRADED_MS
-  );
+  return degradedReasons(stats).length > 0;
+}
+
+/** Which specific thresholds tripped — so monitors can route, not just page. */
+export function degradedReasons(stats: QueueStats): string[] {
+  const reasons: string[] = [];
+  if (stats.queueDepth >= HEALTH_QUEUE_DEPTH_DEGRADED) reasons.push("queue-depth");
+  if (stats.dlqCount >= HEALTH_DLQ_DEGRADED) reasons.push("dlq");
+  if (stats.oldestActiveAgeMs >= HEALTH_OLDEST_JOB_DEGRADED_MS) reasons.push("oldest-job");
+  return reasons;
 }
 
 export function buildHealthBody(
@@ -35,11 +40,13 @@ export function buildHealthBody(
 ): Record<string, unknown> {
   if (!stats) {
     // Could not read queue state — that is itself a degraded signal.
-    return { ...base, status: "degraded", queue: { error: "queue stats unavailable" } };
+    return { ...base, status: "degraded", reasons: ["stats-unavailable"], queue: { error: "queue stats unavailable" } };
   }
+  const reasons = degradedReasons(stats);
   return {
     ...base,
-    status: isDegraded(stats) ? "degraded" : "ok",
+    status: reasons.length > 0 ? "degraded" : "ok",
+    ...(reasons.length > 0 ? { reasons } : {}),
     queue: {
       depth: stats.queueDepth,
       dlq: stats.dlqCount,

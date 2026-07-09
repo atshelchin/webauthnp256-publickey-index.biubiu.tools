@@ -2,15 +2,16 @@ import { getPublicKey } from "../../shared/contract-read.ts";
 import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
-import { cacheGet, cacheSet, cacheKey as cacheKey_ } from "../../shared/cache.ts";
+import { cacheGet, cacheSet, cacheKey as cacheKey_, NOT_FOUND } from "../../shared/cache.ts";
 import { validateStringLength } from "../../shared/validation.ts";
+import { readBodyLimited } from "../../shared/body.ts";
 import { isDependencyError } from "../../shared/routes/errors.ts";
 import { MAX_ACTIVE_QUEUE_DEPTH } from "../../shared/routes/health.ts";
 import { log } from "../../shared/log.ts";
 
 const MAX_BODY_SIZE = 32 * 1024; // 32KB
 
-export async function handleCreate(req: Request): Promise<Response> {
+export async function handleCreate(req: Request, requestId?: string): Promise<Response> {
   // Reject oversized bodies before parsing
   const contentLength = req.headers.get("content-length");
   const contentLengthNum = Number(contentLength);
@@ -28,11 +29,19 @@ export async function handleCreate(req: Request): Promise<Response> {
     metadata?: string;
   };
 
+  // Stream-limited read: memory use is bounded by MAX_BODY_SIZE even for
+  // chunked / no-Content-Length requests (req.text() would buffer everything
+  // BEFORE any length check — a memory-DoS vector on the single-process host).
+  let text: string | null;
   try {
-    const text = await req.text();
-    if (text.length > MAX_BODY_SIZE) {
-      return Response.json({ error: "request body too large" }, { status: 413 });
-    }
+    text = await readBodyLimited(req, MAX_BODY_SIZE);
+  } catch {
+    return Response.json({ error: "invalid request body" }, { status: 400 });
+  }
+  if (text === null) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+  try {
     body = JSON.parse(text);
   } catch {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
@@ -85,10 +94,13 @@ export async function handleCreate(req: Request): Promise<Response> {
     ["VelaWalletV1", publicKeyHex],
   );
 
-  // Already exists on-chain — return success (idempotent)
+  // Already exists on-chain — return success (idempotent). MUST exclude the
+  // negative-cache sentinel: a cached "not found" is NOT a record, and
+  // spreading it into a 201 "done" body would silently DROP the user's create
+  // (they'd think the account exists when nothing was ever enqueued).
   const cacheKey = cacheKey_("query", rpId, credentialId);
   const cached = cacheGet<object>(cacheKey);
-  if (cached) {
+  if (cached && cached !== NOT_FOUND) {
     return Response.json({ ...cached, status: "done" }, { status: 201 });
   }
   // The on-chain precheck is only a fast-path optimization (return 201 if the
@@ -101,7 +113,7 @@ export async function handleCreate(req: Request): Promise<Response> {
   } catch (err) {
     if (!isDependencyError(err)) throw err;
     log.warn("create precheck skipped: chain unreachable, enqueueing anyway", {
-      dependency: "rpc", operation: "getRecord", rpId, error_category: err.classified.category,
+      request_id: requestId, dependency: "rpc", operation: "getRecord", rpId, error_category: err.classified.category,
     });
   }
   if (existing) {
@@ -121,7 +133,7 @@ export async function handleCreate(req: Request): Promise<Response> {
   // is evaded. Fail-open on a stats hiccup (never block a create on a count error).
   try {
     if (getActiveQueueDepth() >= MAX_ACTIVE_QUEUE_DEPTH || globalWriteLimitExceeded()) {
-      log.warn("create shed: backpressure / global write cap", { operation: "create", outcome: "shed" });
+      log.warn("create shed: backpressure / global write cap", { request_id: requestId, operation: "create", outcome: "shed" });
       return Response.json(
         { error: "service busy, please retry shortly", retryable: true },
         { status: 503, headers: { "Retry-After": "30" } },

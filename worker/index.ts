@@ -10,11 +10,12 @@ import { handleChallenge } from "../shared/routes/challenge.ts";
 import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../shared/routes/stats.ts";
 import { handleQuery } from "./routes/query.ts";
 import { handleCreate, handleCreateStatus } from "./routes/create.ts";
-import { initQueue, getQueueStats } from "./queue.ts";
-import { setIpHashSalt } from "../shared/queue.ts";
+import { initQueue, getQueueStats, setGlobalWriteLimit } from "./queue.ts";
+import { setIpHashSalt, deriveIpSalt } from "../shared/queue.ts";
+import { configureCache } from "../shared/cache.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
 import { withCors } from "../shared/cors.ts";
-import { log, newRequestId } from "../shared/log.ts";
+import { log, newRequestId, setLogLevel } from "../shared/log.ts";
 import type { Env } from "./types.ts";
 
 export { QueueProcessor } from "./queue-processor.ts";
@@ -26,7 +27,7 @@ const HOME_HTML = `<!DOCTYPE html>
 
 
 let rpcInitialized = false;
-let queueInitialized = false;
+let queueInitPromise: Promise<void> | null = null;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -34,18 +35,21 @@ export default {
     if (!rpcInitialized) {
       await initRpc();
       if (env.ALCHEMY_API_KEY) setAlchemyRpc(env.ALCHEMY_API_KEY);
-      // Salt IP hashing with a server secret so stored hashes can't be brute-
-      // forced back to raw IPs if D1 leaks.
-      setIpHashSalt(env.PRIVATE_KEY || "webauthnp256-index");
+      // Salt IP hashing with a DERIVED secret (never the raw signing key) so
+      // stored hashes can't be brute-forced back to raw IPs if D1 leaks.
+      setIpHashSalt(await deriveIpSalt(env.PRIVATE_KEY || "webauthnp256-index"));
+      if (env.LOG_LEVEL) setLogLevel(env.LOG_LEVEL);
+      // Workers isolates have a 128MB budget — cap the cache well below it
+      // (overridable via the CACHE_MAX_MB var; GLOBAL_WRITE_LIMIT likewise).
+      const cacheMaxMb = Number(env.CACHE_MAX_MB ?? "8");
+      configureCache({ maxBytes: (Number.isFinite(cacheMaxMb) && cacheMaxMb > 0 ? cacheMaxMb : 8) * 1024 * 1024 });
+      const gwl = Number(env.GLOBAL_WRITE_LIMIT);
+      if (Number.isFinite(gwl) && gwl > 0) setGlobalWriteLimit(gwl);
       rpcInitialized = true;
     }
 
-    // Initialize D1 queue tables (lazy)
-    if (!queueInitialized) {
-      await initQueue(env.DB);
-      queueInitialized = true;
-    }
-
+    // OPTIONS preflight is answered BEFORE any DB init — a browser preflight
+    // must never depend on / be blocked by a D1 outage.
     if (request.method === "OPTIONS") {
       return withCors(new Response(null, { status: 204 }), request);
     }
@@ -58,6 +62,20 @@ export default {
     let response: Response;
 
     try {
+      // Initialize D1 queue tables (lazy, memoized per isolate). A single shared
+      // promise means concurrent first requests await ONE migration run instead
+      // of racing it. A failed run clears the memo so the next request retries.
+      // Migrations are idempotent + INSERT OR IGNORE, so a cross-ISOLATE race is
+      // also safe. Inside the try so a D1 init failure yields a CORS'd JSON 500
+      // with an X-Request-Id (not a raw exception page).
+      if (!queueInitPromise) {
+        queueInitPromise = initQueue(env.DB).catch((err) => {
+          queueInitPromise = null;
+          throw err;
+        });
+      }
+      await queueInitPromise;
+
       if (path === "/" && request.method === "GET") {
         response = new Response(HOME_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -70,6 +88,7 @@ export default {
           chainId: 100,
           contract: CONTRACT_ADDRESS,
           rpcCircuit: getReadCircuitState(),
+          telegramConfigured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
         };
         let stats = null;
         try { stats = await getQueueStats(env.DB); } catch { /* DB hiccup → degraded */ }
@@ -79,11 +98,11 @@ export default {
       } else if (path === "/api/query" && request.method === "GET") {
         response = await handleQuery(request, env.DB);
       } else if (path === "/api/create" && request.method === "POST") {
-        response = await handleCreate(request, env.DB);
+        response = await handleCreate(request, env.DB, requestId);
       } else if (path.startsWith("/api/create/") && request.method === "GET") {
         response = await handleCreateStatus(request, env.DB);
       } else if (path === "/api/stats/total" && request.method === "GET") {
-        response = await handleTotalCredentials();
+        response = await handleTotalCredentials(request);
       } else if (path === "/api/stats/sites" && request.method === "GET") {
         response = await handleListRpIds(request);
       } else if (path === "/api/stats/keys" && request.method === "GET") {
@@ -103,14 +122,19 @@ export default {
     }
     response.headers.set("X-Request-Id", requestId);
 
-    // Ensure queue processor DO is running
-    ctx.waitUntil((async () => {
-      try {
-        const doId = env.QUEUE_PROCESSOR.idFromName("main");
-        const doStub = env.QUEUE_PROCESSOR.get(doId);
-        await doStub.fetch(new Request("https://do/start"));
-      } catch { /* ignore */ }
-    })());
+    // Ensure the queue processor DO is running — but only when this request
+    // actually created queue work. Pinging on EVERY request was a subrequest
+    // per hit (cost/latency amplification); the every-minute cron already
+    // guarantees liveness for everything else.
+    if (path === "/api/create" && request.method === "POST") {
+      ctx.waitUntil((async () => {
+        try {
+          const doId = env.QUEUE_PROCESSOR.idFromName("main");
+          const doStub = env.QUEUE_PROCESSOR.get(doId);
+          await doStub.fetch(new Request("https://do/start"));
+        } catch { /* ignore */ }
+      })());
+    }
 
     return withCors(response, request);
   },

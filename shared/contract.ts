@@ -1,3 +1,4 @@
+import { isRevertError } from "./reliability.ts";
 import { type Abi } from "viem";
 
 export const CONTRACT_ABI = [
@@ -209,6 +210,7 @@ export function formatRecord(record: {
 }
 
 export function isContractRevert(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes("reverted") || msg.includes("revert");
+  // Structured detection (walks viem's error chain; text only as fallback) —
+  // a provider message merely CONTAINING "revert" must not become a false 404.
+  return isRevertError(err);
 }

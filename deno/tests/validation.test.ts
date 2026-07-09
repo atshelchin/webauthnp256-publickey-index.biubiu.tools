@@ -5,7 +5,7 @@ Deno.test("validateStringLength passes valid inputs", () => {
   assertEquals(validateStringLength({
     rpId: "example.com",
     credentialId: "abc123",
-    publicKey: "04" + "aa".repeat(64),
+    publicKey: "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
     name: "My Key",
   }), null);
 });
@@ -78,7 +78,7 @@ Deno.test("validateStringLength rejects non-hex metadata", () => {
 });
 
 Deno.test("validateStringLength accepts valid hex with 0x prefix", () => {
-  assertEquals(validateStringLength({ publicKey: "04" + "ab".repeat(64) }), null);
+  assertEquals(validateStringLength({ publicKey: "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5" }), null);
   assertEquals(validateStringLength({ walletRef: "0x" + "ff".repeat(32) }), null);
   assertEquals(validateStringLength({ metadata: "0x" + "00".repeat(10) }), null);
 });
@@ -103,7 +103,9 @@ Deno.test("validateStringLength rejects a non-P256 / odd-length publicKey", () =
     const r = validateStringLength({ publicKey: bad });
     assertEquals(typeof r, "string", `should reject publicKey ${bad}`);
   }
-  assertEquals(validateStringLength({ publicKey: "04" + "aa".repeat(64) }), null);
+  // NOTE: a 0x-prefixed publicKey is 132 chars and is rejected by the 130-char
+  // length cap — pre-existing behavior, unchanged by the on-curve check.
+  assertEquals(validateStringLength({ publicKey: "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5" }), null);
 });
 
 Deno.test("validateStringLength rejects odd-length (non-byte-aligned) metadata", () => {
@@ -111,4 +113,16 @@ Deno.test("validateStringLength rejects odd-length (non-byte-aligned) metadata",
   assertEquals(typeof r, "string");
   assertEquals(r!.includes("metadata"), true);
   assertEquals(validateStringLength({ metadata: "0xabcd" }), null);
+});
+
+// --- On-curve enforcement (P2-2): format-valid but off-curve keys burn commit
+// gas and strand the user's create in the DLQ at reveal time — reject at POST.
+Deno.test("validateStringLength rejects a format-valid but OFF-CURVE publicKey", () => {
+  const offCurve = "04" + "aa".repeat(64); // correct shape, not a P-256 point
+  const err = validateStringLength({ publicKey: offCurve });
+  assertEquals(err, "publicKey must be a valid point on the P-256 curve");
+});
+
+Deno.test("validateStringLength accepts a genuine P-256 point (curve generator)", () => {
+  assertEquals(validateStringLength({ publicKey: "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5" }), null);
 });

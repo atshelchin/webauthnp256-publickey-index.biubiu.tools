@@ -160,6 +160,16 @@ function inspect(err: unknown): {
   return { status, retryAfterMs, isRevert };
 }
 
+/**
+ * Structured revert detection: walks viem's nested error chain for
+ * ContractFunctionRevertedError (text match only as a last resort). Exported
+ * so isContractRevert stops being a bare `includes("revert")` that could
+ * misread provider prose as a business revert (→ false 404s).
+ */
+export function isRevertError(err: unknown): boolean {
+  return inspect(err).isRevert;
+}
+
 /** Parse an HTTP Retry-After value (delta-seconds or HTTP-date) into ms. */
 export function parseRetryAfter(value: string | null | undefined, nowMs = Date.now()): number | undefined {
   if (!value) return undefined;

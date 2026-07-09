@@ -2,15 +2,16 @@ import { getPublicKey } from "../../shared/contract-read.ts";
 import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
-import { cacheGet, cacheSet, cacheKey as cacheKey_ } from "../../shared/cache.ts";
+import { cacheGet, cacheSet, cacheKey as cacheKey_, NOT_FOUND } from "../../shared/cache.ts";
 import { validateStringLength } from "../../shared/validation.ts";
+import { readBodyLimited } from "../../shared/body.ts";
 import { isDependencyError } from "../../shared/routes/errors.ts";
 import { MAX_ACTIVE_QUEUE_DEPTH } from "../../shared/routes/health.ts";
 import { log } from "../../shared/log.ts";
 
 const MAX_BODY_SIZE = 32 * 1024;
 
-export async function handleCreate(req: Request, db: D1Database): Promise<Response> {
+export async function handleCreate(req: Request, db: D1Database, requestId?: string): Promise<Response> {
   const contentLength = req.headers.get("content-length");
   const contentLengthNum = Number(contentLength);
   if (contentLength && (Number.isNaN(contentLengthNum) || contentLengthNum > MAX_BODY_SIZE)) {
@@ -27,11 +28,19 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
     metadata?: string;
   };
 
+  // Stream-limited read: memory use is bounded by MAX_BODY_SIZE even for
+  // chunked / no-Content-Length requests (req.text() would buffer everything
+  // BEFORE any length check — a memory-DoS vector on the single-process host).
+  let text: string | null;
   try {
-    const text = await req.text();
-    if (text.length > MAX_BODY_SIZE) {
-      return Response.json({ error: "request body too large" }, { status: 413 });
-    }
+    text = await readBodyLimited(req, MAX_BODY_SIZE);
+  } catch {
+    return Response.json({ error: "invalid request body" }, { status: 400 });
+  }
+  if (text === null) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+  try {
     body = JSON.parse(text);
   } catch {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
@@ -79,10 +88,12 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
     ["VelaWalletV1", publicKeyHex],
   );
 
-  // Already exists on-chain
+  // Already exists on-chain (idempotent). MUST exclude the negative-cache
+  // sentinel — a cached "not found" is NOT a record; spreading it into a 201
+  // "done" body would silently DROP the user's create.
   const cacheKey = cacheKey_("query", rpId, credentialId);
   const cached = cacheGet<object>(cacheKey);
-  if (cached) {
+  if (cached && cached !== NOT_FOUND) {
     return Response.json({ ...cached, status: "done" }, { status: 201 });
   }
   // Precheck is a fast-path only; a transient chain outage must not fail create.
@@ -94,7 +105,7 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
   } catch (err) {
     if (!isDependencyError(err)) throw err;
     log.warn("create precheck skipped: chain unreachable, enqueueing anyway", {
-      dependency: "rpc", operation: "getRecord", rpId, error_category: err.classified.category,
+      request_id: requestId, dependency: "rpc", operation: "getRecord", rpId, error_category: err.classified.category,
     });
   }
   if (existing) {
@@ -108,18 +119,26 @@ export async function handleCreate(req: Request, db: D1Database): Promise<Respon
     return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
   }
 
-  // Backpressure: shed genuinely-new work when the active queue is dangerously
-  // deep. Fail-open on a stats hiccup (never block a create on a counting error).
   // Backpressure + global write cap (bounds gas spend even if per-IP is evaded).
+  // DECISION (availability-first, operator requirement): these gates FAIL OPEN
+  // on a D1 error — a storage hiccup must NEVER reject a legitimate user's
+  // account creation. The residual abuse window is bounded (Gnosis gas is tiny,
+  // commit-reveal costs the attacker time) and the skip is logged for
+  // visibility instead of failing closed.
   try {
     if (await getActiveQueueDepth(db) >= MAX_ACTIVE_QUEUE_DEPTH || await globalWriteLimitExceeded(db)) {
-      log.warn("create shed: backpressure / global write cap", { operation: "create", outcome: "shed" });
+      log.warn("create shed: backpressure / global write cap", { request_id: requestId, operation: "create", outcome: "shed" });
       return Response.json(
         { error: "service busy, please retry shortly", retryable: true },
         { status: 503, headers: { "Retry-After": "30" } },
       );
     }
-  } catch { /* stats unavailable — allow the create */ }
+  } catch (err) {
+    log.warn("write gates skipped: D1 unavailable (fail-open by design)", {
+      request_id: requestId, operation: "create", outcome: "gate-skipped", dependency: "d1",
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // Enqueue
   const id = await enqueue(db, { rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip });

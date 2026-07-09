@@ -8,14 +8,12 @@ import {
   type QueueStatus,
   RATE_WINDOW,
   DEFAULT_RATE_LIMIT,
-  CREATE_QUEUE_DDL,
-  CREATE_ACTIVE_UNIQUE_INDEX,
-  DEDUPE_ACTIVE_DUPLICATES_SQL,
   GLOBAL_WRITE_WINDOW,
   DEFAULT_GLOBAL_WRITE_LIMIT,
   isUniqueConstraintError,
   hashIp,
 } from "../shared/queue.ts";
+import { runMigrations, type SqlRunner } from "../shared/migrations.ts";
 import { log } from "../shared/log.ts";
 import type { QueueStats } from "../shared/routes/health.ts";
 
@@ -38,6 +36,10 @@ const D1_TRANSIENT_PATTERNS = [
 
 export function isTransientD1Error(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  // Deterministic failures the "d1_error" catch-all would otherwise retry 3x:
+  // a constraint hit (idempotency race / migration version conflict) or a
+  // tolerated duplicate-column ALTER are NOT transient.
+  if (msg.includes("constraint") || msg.includes("duplicate column")) return false;
   return D1_TRANSIENT_PATTERNS.some((p) => msg.includes(p));
 }
 
@@ -57,25 +59,22 @@ export async function withD1Retry<T>(op: () => Promise<T>, attempts = 3): Promis
 }
 
 export async function initQueue(db: D1Database): Promise<void> {
-  await withD1Retry(() => db.batch([
-    db.prepare(CREATE_QUEUE_DDL),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)"),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)"),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)"),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_created ON create_queue(createdAt)"), // global write-rate cap
-    // Idempotency: dedupe any pre-existing active duplicates (ordered before the
-    // unique index so it can build on a DB that already contains duplicates),
-    // then enforce at-most-one-active-row per (rpId, credentialId).
-    db.prepare(DEDUPE_ACTIVE_DUPLICATES_SQL).bind(Date.now()),
-    db.prepare(CREATE_ACTIVE_UNIQUE_INDEX),
-    db.prepare(`
-      CREATE TABLE IF NOT EXISTS rate_limits (
-        ip_hash TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-      )
-    `),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_rate_ip ON rate_limits(ip_hash, timestamp)"),
-  ]));
+  // Versioned shared migrations. When the schema is current this is TWO cheap
+  // statements — the previous scheme re-ran the full 8-statement DDL batch
+  // (including a full-table dedupe UPDATE) on every isolate cold start, in the
+  // request path.
+  const runner: SqlRunner = {
+    async run(sql, params) {
+      await withD1Retry(() => (params && params.length > 0 ? db.prepare(sql).bind(...params) : db.prepare(sql)).run());
+    },
+    async scalar(sql) {
+      const row = await withD1Retry(() => db.prepare(sql).first<Record<string, unknown>>());
+      if (!row) return undefined;
+      const v = Object.values(row)[0];
+      return v == null ? undefined : Number(v);
+    },
+  };
+  await runMigrations(runner, Date.now());
 }
 
 export async function checkRateLimit(db: D1Database, ip: string): Promise<boolean> {
@@ -156,13 +155,19 @@ export async function getActiveQueueDepth(db: D1Database): Promise<number> {
   return r?.c ?? 0;
 }
 
+let GLOBAL_WRITE_LIMIT = DEFAULT_GLOBAL_WRITE_LIMIT;
+/** Set the global write cap (from the GLOBAL_WRITE_LIMIT binding at init). */
+export function setGlobalWriteLimit(limit: number): void {
+  if (Number.isFinite(limit) && limit > 0) GLOBAL_WRITE_LIMIT = limit;
+}
+
 /** True when the GLOBAL create rate (across all clients) is at the cap — bounds gas burn. */
 export async function globalWriteLimitExceeded(db: D1Database): Promise<boolean> {
   const since = Date.now() - GLOBAL_WRITE_WINDOW;
   const r = await withD1Retry(() =>
     db.prepare("SELECT COUNT(*) as c FROM create_queue WHERE createdAt > ?").bind(since).first<{ c: number }>()
   );
-  return (r?.c ?? 0) >= DEFAULT_GLOBAL_WRITE_LIMIT;
+  return (r?.c ?? 0) >= GLOBAL_WRITE_LIMIT;
 }
 
 /** Queue health snapshot for /api/health. */
@@ -190,5 +195,14 @@ export async function findDuplicate(db: D1Database, rpId: string, credentialId: 
     db.prepare(
       "SELECT * FROM create_queue WHERE rpId = ? AND credentialId = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
     ).bind(rpId, credentialId).first<QueueItem>()
+  ) ?? null;
+}
+
+/** Queue lookup by walletRef — the query-by-walletRef path's local fallback. */
+export async function findDuplicateByWalletRef(db: D1Database, walletRef: string): Promise<QueueItem | null> {
+  return await withD1Retry(() =>
+    db.prepare(
+      "SELECT * FROM create_queue WHERE walletRef = ? ORDER BY (status = 'failed') ASC, createdAt DESC, id DESC LIMIT 1"
+    ).bind(walletRef).first<QueueItem>()
   ) ?? null;
 }

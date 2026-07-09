@@ -11,7 +11,10 @@ import { log } from "./log.ts";
 
 // --- Types ---
 
-export type QueueStatus = "pending" | "committing" | "committed" | "creating" | "done" | "failed";
+// NOTE: 'creating' is legacy (rolling-upgrade safety net — see queue-engine
+// processCreating); no new rows enter it. A former 'committing' member had no
+// readers or writers anywhere and was removed.
+export type QueueStatus = "pending" | "committed" | "creating" | "done" | "failed";
 
 export interface QueueItem {
   id: string;
@@ -46,7 +49,12 @@ export const DEFAULT_RATE_LIMIT = 5;
 // and operator-tunable, instead of unbounded. Counted via the shared queue
 // table so it holds across instances/isolates.
 export const GLOBAL_WRITE_WINDOW = 60_000;
-export const DEFAULT_GLOBAL_WRITE_LIMIT = 120;
+// Default 40/min (was 120): the pipeline's measured drain is ~40-60 items/min
+// (sub-batch receipt waits serialize); admitting 120/min let a sustained flood
+// legally build an hours-long backlog until the 10k shed. Tunable via the
+// GLOBAL_WRITE_LIMIT env (Deno) / binding (CF) — raise it together with
+// TX_BATCH_SIZE/interval if real traffic ever approaches it.
+export const DEFAULT_GLOBAL_WRITE_LIMIT = 40;
 export const MAX_GAS_PRICE_GWEI = 0.1;
 export const GAS_BALANCE_THRESHOLD = 0.01;
 export const FUND_THRESHOLD = 0.005;
@@ -166,6 +174,16 @@ export function setIpHashSalt(salt: string): void {
   ipHashSalt = salt;
 }
 
+/**
+ * Derive the IP-hash salt from the deployment secret instead of using the raw
+ * funds-controlling PRIVATE_KEY as salt material (key-hygiene: the signing key
+ * should never feed unrelated hash paths).
+ */
+export async function deriveIpSalt(secret: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`ip-salt\0${secret}`));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export async function hashIp(ip: string): Promise<string> {
   const data = new TextEncoder().encode(`${ipHashSalt}\0${ip}`);
   const hash = await crypto.subtle.digest("SHA-256", data);
@@ -236,9 +254,19 @@ export function getCommitWallet(config: AppConfig) {
 
 const TELEGRAM_TIMEOUT = 5_000;
 
+let warnedNoTelegram = false;
 export async function sendTelegram(config: AppConfig, message: string): Promise<void> {
   const { telegramBotToken: botToken, telegramChatId: chatId } = config;
-  if (!botToken || !chatId) return;
+  if (!botToken || !chatId) {
+    // Alerting is the operator's only eyes on this unattended fund-spending
+    // queue. A missing channel is itself worth one loud log (once) so a
+    // deploy without TELEGRAM_* doesn't run blind and silent.
+    if (!warnedNoTelegram) {
+      warnedNoTelegram = true;
+      log.warn("Telegram NOT configured — operator alerts will not be delivered", { dependency: "telegram", operation: "config", outcome: "unconfigured" });
+    }
+    return;
+  }
   try {
     // Bounded: a hung Telegram API must never stall the single-flight queue
     // worker / Durable Object alarm (which awaits this during checkAlerts).

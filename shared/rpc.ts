@@ -8,7 +8,6 @@ import { redactSecrets } from "./log.ts";
 
 const CHAIN_DATA_URL = "https://ethereum-data.awesometools.dev/chains/eip155-100.json";
 const REFRESH_INTERVAL = 15 * 60_000; // refresh RPC list every 15 minutes
-const HEALTH_CHECK_TIMEOUT = 5000; // 5s
 
 // Fallback RPCs in case the remote list is unreachable
 const FALLBACK_RPCS = [
@@ -65,11 +64,11 @@ async function fetchRpcList(): Promise<string[]> {
   try {
     const res = await fetch(CHAIN_DATA_URL, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return [];
-    const data = await res.json();
+    const data = await res.json() as { rpc?: unknown[] };
     const rpcs: string[] = [];
     // Extract HTTP(S) RPC URLs from the chain data
     for (const provider of data.rpc ?? []) {
-      const url = typeof provider === "string" ? provider : provider?.url;
+      const url = typeof provider === "string" ? provider : (provider as { url?: string } | null)?.url;
       // Only adopt https endpoints on the reputable-host allowlist — a poisoned
       // chain-data source must not be able to inject a data-forging RPC.
       if (typeof url === "string" && url.startsWith("https://") && !url.includes("${") && isAllowedRpcHost(url)) {
@@ -199,12 +198,6 @@ export function readCircuitRetryAfterMs(): number {
   return soonest;
 }
 
-export function failover(): string {
-  const next = getCurrentRpc();
-  console.warn(`[rpc] Failover to: ${redactSecrets(next)}`);
-  return next;
-}
-
 export async function initRpc(): Promise<void> {
   const fetched = await fetchRpcList();
   if (fetched.length > 0) {
@@ -216,31 +209,11 @@ export async function initRpc(): Promise<void> {
   lastRefresh = Date.now();
 
   // Periodic refresh (only in long-lived runtimes like Deno, not CF Workers)
-  if (typeof Deno !== "undefined") {
+  if ((globalThis as { Deno?: unknown }).Deno !== undefined) {
     setInterval(() => {
       refreshIfNeeded().catch(() => {});
     }, REFRESH_INTERVAL);
   }
-}
-
-/**
- * Get a working RPC URL. Tries current, on failure cycles through the list.
- */
-export async function getHealthyRpc(): Promise<string> {
-  await refreshIfNeeded();
-
-  // Try current first
-  const current = getCurrentRpc();
-  if (await isHealthy(current)) return current;
-
-  // Cycle through others
-  for (let i = 1; i < rpcList.length; i++) {
-    const url = failover();
-    if (await isHealthy(url)) return url;
-  }
-
-  // All failed, return current anyway and let caller handle error
-  return getCurrentRpc();
 }
 
 /** Reset internal state (for testing only). */
@@ -252,20 +225,4 @@ export function _resetForTest(rpcs?: string[]): void {
   lastRefresh = Date.now();
   lastProbeAt = 0;
   alchemyRpc = null;
-}
-
-async function isHealthy(url: string): Promise<boolean> {
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "eth_blockNumber", params: [], id: 1 }),
-      signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT),
-    });
-    if (!res.ok) return false;
-    const data = await res.json();
-    return !!data.result;
-  } catch {
-    return false;
-  }
 }
