@@ -431,6 +431,9 @@ async function maybeHeartbeat(): Promise<void> {
       uptimeMs: now - processStartedAt,
       release,
     }));
+    // One info line a day so "heartbeat sent" is VERIFIABLE in journald —
+    // delivery failures are already warned by sendTelegram itself.
+    log.info("daily heartbeat sent", { operation: "heartbeat", outcome: "sent", queue_depth: stats.queueDepth, dlq: stats.dlqCount });
   } catch (err) {
     // Never let the heartbeat break a cycle; a failed heartbeat is itself a
     // signal (the daily message stops arriving).
