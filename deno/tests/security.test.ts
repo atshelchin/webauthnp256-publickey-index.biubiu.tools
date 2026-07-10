@@ -36,7 +36,7 @@ Deno.test("hashIp: salt changes the digest so a DB leak can't brute-force the ra
 // ── Global write cap (gas-drain bound, independent of per-IP) ───────────────────
 
 Deno.test("globalWriteLimitExceeded: trips once the global create rate hits the cap", async () => {
-  initQueue(":memory:");
+  await initQueue(":memory:");
   cacheClear();
   _setRateLimitForTest(Infinity);   // isolate the GLOBAL cap from the per-IP one
   _setGlobalWriteLimitForTest(3);   // tiny cap for the test
@@ -56,10 +56,10 @@ Deno.test("globalWriteLimitExceeded: trips once the global create rate hits the 
 
 // ── Poison-row quarantine is reachable (DLQ, not a crash) ──────────────────────
 
-Deno.test("a malformed walletRef row is quarantined, never crashes the batch builder", () => {
+Deno.test("a malformed walletRef row is quarantined, never crashes the batch builder", async () => {
   // Insert a poison row directly (bypassing validation, as a legacy/edge row),
   // then confirm buildCommitment throwing on it is contained per-item.
-  initQueue(":memory:");
+  await initQueue(":memory:");
   const db = getQueueDb();
   db.prepare(
     "INSERT INTO create_queue (id, status, rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata, ip, createdAt, updatedAt) VALUES ('poison','pending','e.com','c','0xdead','04','n','c','0x','',?,?)",

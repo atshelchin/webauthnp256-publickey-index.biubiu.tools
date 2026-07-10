@@ -2,6 +2,7 @@
  * Input validation for API routes.
  * Prevents oversized inputs from consuming memory or polluting cache.
  */
+import { p256 } from "@noble/curves/nist";
 
 // Max lengths for string fields (bytes)
 const LIMITS = {
@@ -42,8 +43,19 @@ export function validateStringLength(
       if (name === "walletRef" && hex.length !== 64) {
         return "walletRef must be a 32-byte hex string (64 hex chars)";
       }
-      if (name === "publicKey" && !/^04[0-9a-fA-F]{128}$/.test(hex)) {
-        return "publicKey must be an uncompressed P256 key (04 + 128 hex chars)";
+      if (name === "publicKey") {
+        if (!/^04[0-9a-fA-F]{128}$/.test(hex)) {
+          return "publicKey must be an uncompressed P256 key (04 + 128 hex chars)";
+        }
+        // On-curve check: a format-valid but off-curve point would pass here,
+        // burn real commit gas, and only revert at reveal — landing the user's
+        // create in the DLQ hours later. Rejecting at the trust boundary turns
+        // a silent stall into an immediate, actionable 400 for the client.
+        try {
+          p256.ProjectivePoint.fromHex(hex);
+        } catch {
+          return "publicKey must be a valid point on the P-256 curve";
+        }
       }
       if (name === "metadata" && hex.length % 2 !== 0) {
         return "metadata must be byte-aligned hex (even number of hex chars)";

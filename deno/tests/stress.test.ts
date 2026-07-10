@@ -56,7 +56,7 @@ async function setup() {
   try { Deno.removeSync(dbPath); } catch { /* ok */ }
   try { Deno.removeSync(dbPath + "-shm"); } catch { /* ok */ }
   try { Deno.removeSync(dbPath + "-wal"); } catch { /* ok */ }
-  initQueue(dbPath);
+  await initQueue(dbPath);
   _setRateLimitForTest(Infinity);
   cacheClear();
 

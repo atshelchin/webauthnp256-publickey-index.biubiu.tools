@@ -5,5 +5,11 @@ export interface Env {
   TELEGRAM_CHAT_ID: string;
   /** Optional priority write RPC (mirrors the Deno runtime's ALCHEMY_API_KEY support). */
   ALCHEMY_API_KEY?: string;
+  /** Optional cache budget in MB (default 8 on Workers' 128MB isolates). */
+  CACHE_MAX_MB?: string;
+  /** Optional global create cap per minute (default 40). */
+  GLOBAL_WRITE_LIMIT?: string;
+  /** Optional minimum log level: debug|info|warn|error (default debug). */
+  LOG_LEVEL?: string;
   QUEUE_PROCESSOR: DurableObjectNamespace;
 }

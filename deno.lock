@@ -5,6 +5,7 @@
     "jsr:@std/internal@^1.0.12": "1.0.13",
     "npm:@cloudflare/vitest-pool-workers@~0.5.41": "0.5.41_@vitest+runner@2.1.9_@vitest+snapshot@2.1.9_vitest@2.1.9_@cloudflare+workers-types@4.20260604.1",
     "npm:@cloudflare/workers-types@^4.20241205.0": "4.20260604.1",
+    "npm:@noble/curves@1": "1.9.1",
     "npm:marked@17": "17.0.6",
     "npm:viem@2": "2.47.5",
     "npm:vitest@2.1": "2.1.9",
@@ -1174,6 +1175,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@std/assert@1",
+      "npm:@noble/curves@1",
       "npm:marked@17",
       "npm:viem@2"
     ],
@@ -1181,6 +1183,8 @@
       "dependencies": [
         "npm:@cloudflare/vitest-pool-workers@~0.5.41",
         "npm:@cloudflare/workers-types@^4.20241205.0",
+        "npm:@noble/curves@^1.4.0",
+        "npm:typescript@^7.0.2",
         "npm:viem@2",
         "npm:vitest@2.1",
         "npm:wrangler@^3.100.0"

@@ -61,3 +61,16 @@ Deno.test("stats handler returns 503 + Retry-After when there is no last-known-g
     cleanup();
   }
 });
+
+// --- Negative-cache sentinel must never be served as a stale record body ---
+import { NOT_FOUND, NEGATIVE_TTL_MS, cacheSet as _cs, cacheGetStale as _cgs } from "../../shared/cache.ts";
+
+Deno.test("a cached NOT_FOUND sentinel is retained but callers can distinguish it from a record", () => {
+  _cs("neg:test:key", NOT_FOUND, NEGATIVE_TTL_MS);
+  const stale = _cgs<object>("neg:test:key");
+  // The sentinel is reference-comparable — the query routes rely on this to
+  // return 503 (not a fabricated 200 body) when the chain is down and the
+  // only cached state is a negative.
+  if (!stale) throw new Error("sentinel should be retained for stale reads");
+  if (stale.value !== NOT_FOUND) throw new Error("sentinel must compare by reference");
+});

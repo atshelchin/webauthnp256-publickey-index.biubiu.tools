@@ -11,6 +11,16 @@
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+let minLevel: LogLevel = "debug"; // default preserves historical behavior
+
+/** Set the minimum emitted level (LOG_LEVEL env / binding at startup). */
+export function setLogLevel(level: string): void {
+  if (level === "debug" || level === "info" || level === "warn" || level === "error") {
+    minLevel = level;
+  }
+}
+
 export interface LogFields {
   dependency?: string;       // "rpc" | "d1" | "sqlite" | "telegram" | "chain-data"
   operation?: string;        // "getRecord" | "batchCommit" | "enqueue" | ...
@@ -61,6 +71,7 @@ function redact(fields: LogFields): Record<string, unknown> {
 }
 
 function emit(level: LogLevel, msg: string, fields: LogFields): void {
+  if (LEVEL_ORDER[level] < LEVEL_ORDER[minLevel]) return;
   const record = { level, msg: redactSecrets(msg), ...redact(fields) };
   let line: string;
   try {

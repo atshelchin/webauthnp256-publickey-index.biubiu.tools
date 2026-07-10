@@ -1,5 +1,10 @@
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const DEFAULT_MAX_MEMORY_BYTES = 100 * 1024 * 1024; // 100MB
+// 32MB default (was 100MB): the old cap exceeded the process budgets it lives
+// inside (systemd MemoryMax=256M on Deno with a ~60-100MB runtime baseline;
+// 128MB isolate on CF) — the cache could OOM the process before its own
+// eviction fired. Runtime-tunable via configureCache (CACHE_MAX_MB env on
+// Deno; the CF entrypoint sets a tighter cap for the 128MB isolate).
+const DEFAULT_MAX_MEMORY_BYTES = 32 * 1024 * 1024;
 
 let CACHE_TTL = DEFAULT_CACHE_TTL;
 let MAX_MEMORY_BYTES = DEFAULT_MAX_MEMORY_BYTES;
@@ -18,7 +23,9 @@ let totalSize = 0;
 const encoder = new TextEncoder();
 
 function estimateSize(value: unknown): number {
-  return encoder.encode(JSON.stringify(value)).byteLength;
+  // ×2 overhead factor: JSON bytes undercount real heap use (V8 object shape,
+  // string headers, the key, Map entry) — the budget must reflect actual RAM.
+  return encoder.encode(JSON.stringify(value)).byteLength * 2;
 }
 
 // Approximate LRU: a touched entry moves to the Map tail (most-recently-used),
@@ -61,7 +68,7 @@ export function cacheGetStale<T>(key: string): { value: T; ageMs: number } | und
   return { value: entry.value as T, ageMs: Date.now() - entry.storedAt };
 }
 
-export function cacheSet<T>(key: string, value: T): void {
+export function cacheSet<T>(key: string, value: T, ttlMs?: number): void {
   const existing = store.get(key);
   if (existing) {
     totalSize -= existing.size;
@@ -71,12 +78,21 @@ export function cacheSet<T>(key: string, value: T): void {
   const size = estimateSize(value);
   totalSize += size;
   const now = Date.now();
-  store.set(key, { value, size, expiresAt: now + CACHE_TTL, storedAt: now });
+  store.set(key, { value, size, expiresAt: now + (ttlMs ?? CACHE_TTL), storedAt: now });
 
   if (totalSize > MAX_MEMORY_BYTES) {
     evictOldest();
   }
 }
+
+/**
+ * Negative-cache sentinel: caches "not found on-chain" so repeat lookups for
+ * nonexistent keys (a read-amplification vector — each one costs a chain RPC)
+ * are served from memory. Always cached with a SHORT ttl so a record that
+ * lands on-chain becomes visible promptly. Compare by reference.
+ */
+export const NOT_FOUND: { readonly __notFound: true } = { __notFound: true };
+export const NEGATIVE_TTL_MS = 60_000;
 
 /**
  * Build a collision-safe cache key. User-controlled parts are percent-escaped so
@@ -102,11 +118,14 @@ export function cacheMemoryUsage(): number {
   return totalSize;
 }
 
-/** Override TTL and memory limit (for testing only). */
-export function _configureForTest(opts: { ttl?: number; maxBytes?: number }): void {
+/** Configure TTL / memory budget at startup (env-driven per runtime). */
+export function configureCache(opts: { ttl?: number; maxBytes?: number }): void {
   if (opts.ttl !== undefined) CACHE_TTL = opts.ttl;
   if (opts.maxBytes !== undefined) MAX_MEMORY_BYTES = opts.maxBytes;
 }
+
+/** Override TTL and memory limit (for testing only). */
+export const _configureForTest = configureCache;
 
 /** Reset configuration to defaults (for testing only). */
 export function _resetConfigForTest(): void {

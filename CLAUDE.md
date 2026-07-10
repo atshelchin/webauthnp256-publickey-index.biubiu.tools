@@ -25,10 +25,11 @@ Default to using Deno instead of Node.js or Bun.
 ## Dependencies
 
 Managed via `deno.json` import map. Key dependencies:
-- `@noble/curves` - P256 elliptic curve operations
-- `@noble/hashes` - SHA256 hashing
-- `s3-lite-client` - S3/R2 compatible object storage
+- `viem` - all chain interaction (RPC, wallets, ABI encoding)
+- `@noble/curves` - P-256 on-curve validation of submitted public keys
+- `marked` - README → homepage HTML at build time
 - `@std/assert` - Test assertions
+- SQLite via built-in `node:sqlite` (Deno) / D1 (CF Worker) — no driver dependency
 
 ## Testing
 

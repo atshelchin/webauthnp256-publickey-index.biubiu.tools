@@ -1,14 +1,14 @@
 import { assertEquals, assert } from "@std/assert/";
 import { initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit } from "../queue.ts";
 
-function setup() {
-  initQueue(":memory:");
+async function setup() {
+  await initQueue(":memory:");
 }
 
 // --- Enqueue + retrieve ---
 
 Deno.test("enqueue creates item and getQueueItem retrieves it", async () => {
-  setup();
+  await setup();
   const id = await enqueue({
     rpId: "example.com",
     credentialId: "cred1",
@@ -28,15 +28,15 @@ Deno.test("enqueue creates item and getQueueItem retrieves it", async () => {
   assert(item!.createdAt > 0);
 });
 
-Deno.test("getQueueItem returns null for unknown id", () => {
-  setup();
+Deno.test("getQueueItem returns null for unknown id", async () => {
+  await setup();
   assertEquals(getQueueItem("nonexistent"), null);
 });
 
 // --- findDuplicate ---
 
 Deno.test("findDuplicate finds existing item", async () => {
-  setup();
+  await setup();
   await enqueue({
     rpId: "site.com", credentialId: "c1", walletRef: "0x00", publicKey: "04aa",
     name: "k", initialCredentialId: "c1", metadata: "0x", ip: "1.2.3.4",
@@ -46,15 +46,15 @@ Deno.test("findDuplicate finds existing item", async () => {
   assertEquals(dup!.rpId, "site.com");
 });
 
-Deno.test("findDuplicate returns null when not found", () => {
-  setup();
+Deno.test("findDuplicate returns null when not found", async () => {
+  await setup();
   assertEquals(findDuplicate("nosite.com", "c999"), null);
 });
 
 // --- IP hashing in enqueue ---
 
 Deno.test("enqueue stores hashed IP, not raw", async () => {
-  setup();
+  await setup();
   const id = await enqueue({
     rpId: "x.com", credentialId: "c", walletRef: "0x", publicKey: "04",
     name: "k", initialCredentialId: "c", metadata: "0x", ip: "192.168.1.1",
@@ -69,7 +69,7 @@ Deno.test("enqueue stores hashed IP, not raw", async () => {
 // --- Rate limiting ---
 
 Deno.test("checkRateLimit allows up to 5 requests per IP", async () => {
-  setup();
+  await setup();
   const ip = "10.0.0.1";
   for (let i = 0; i < 5; i++) {
     assertEquals(await checkRateLimit(ip), true, `request ${i + 1} should pass`);
@@ -78,7 +78,7 @@ Deno.test("checkRateLimit allows up to 5 requests per IP", async () => {
 });
 
 Deno.test("checkRateLimit tracks different IPs independently", async () => {
-  setup();
+  await setup();
   // Fill up ip-a
   for (let i = 0; i < 5; i++) await checkRateLimit("ip-a");
   assertEquals(await checkRateLimit("ip-a"), false);

@@ -44,6 +44,17 @@ import { log, redactSecrets } from "./log.ts";
 const CREATING_TIMEOUT = 2 * 60_000;
 const COMMIT_COOLDOWN = 2 * 60_000;
 const RECEIPT_TIMEOUT = 60_000;
+// Stuck-tx unstick sweep: a broadcast whose receipt never arrived within this
+// age is checked and — if still absent from the chain — REPLACED with a
+// same-nonce zero-value self-transfer at a bumped gas price. Without this, one
+// underpriced/stuck tx jams the wallet's nonce sequence and every later send
+// stacks behind it: creates stall for hours until a human intervenes.
+const STUCK_TX_AGE_MS = 2 * 60_000;
+const MAX_UNSTICK_PER_CYCLE = 5;
+const UNSTICK_ALERT_ATTEMPTS = 5; // page after this many failed replacements of one nonce
+const UNSTICK_ALERT_AGE_MS = 10 * 60_000; // ...or after a nonce has been stuck this long (cancel persistently rejected)
+const CANCEL_GAS_NUM = 150n; // 150% of current network gas price
+const CANCEL_GAS_DEN = 100n;
 
 // ── Injected dependency interfaces ────────────────────────────────────────────
 
@@ -74,6 +85,12 @@ export interface QueueStore {
   }): Promise<void>;
   /** DELETE done rows older than DONE_RETENTION and failed rows older than FAILED_RETENTION. */
   cleanupExpired(doneBefore: number, failedBefore: number): Promise<{ doneDeleted: number }>;
+  /** Broadcast ledger for the unstick sweep: upsert an in-flight (role, nonce) → hash, with replacement attempt count. */
+  recordPendingTx(role: NonceRole, nonce: number, hash: string, sentAt: number, attempts?: number): Promise<void>;
+  /** Remove a ledger row once its tx is known to be mined (success OR reverted). */
+  deletePendingTx(role: NonceRole, nonce: number): Promise<void>;
+  /** Ledger rows older than the given sentAt timestamp (potentially stuck). */
+  listPendingTxs(sentBefore: number): Promise<{ role: NonceRole; nonce: number; hash: `0x${string}`; sentAt: number; attempts: number }[]>;
 }
 
 /** Parameter tuple for batchCreateRecord, as consumed by the BatchHelper ABI. */
@@ -118,19 +135,48 @@ export interface ChainOps {
   estimateBatchCommit(commitments: `0x${string}`[]): Promise<bigint>;
   sendBatchCommit(commitments: `0x${string}`[], nonce: number, gas: bigint): Promise<`0x${string}`>;
   waitReceipt(hash: `0x${string}`, timeoutMs: number, role: NonceRole): Promise<{ status: "success" | "reverted" }>;
+  /** Same-nonce zero-value self-transfer at an explicit gas price (stuck-tx replacement). */
+  sendCancel(role: NonceRole, nonce: number, gasPrice: bigint): Promise<`0x${string}`>;
+  /** On-chain confirmed ("latest") nonce count for the role's EOA — sweep ground truth. */
+  getConfirmedNonce(role: NonceRole): Promise<number>;
+}
+
+/** Why the engine is invoking the runtime's alert check this time. */
+export type AlertReason = "cycle-end" | "gas-high" | "gas-fail" | "idle";
+
+export interface ItemFailureInfo {
+  jobId: string;
+  /** true when the item was quarantined to the DLQ (POISON or EXHAUSTED). */
+  terminal: boolean;
+  /** true for deterministic POISON quarantines (code/data bug — dev must act). */
+  poison: boolean;
 }
 
 export interface EngineHooks {
   /**
    * Called after every persisted item failure (retry or DLQ). Runtimes use it
-   * to drive their batched Telegram failure alerts.
+   * to drive Telegram alerts. `info.terminal` failures mean a user's create
+   * request will NOT complete without developer intervention (POISON = code or
+   * data bug; EXHAUSTED = an outage outlived every retry) — runtimes must
+   * surface those IMMEDIATELY, not just via the batched counter.
    */
-  onItemFailure?(errorText: string): void | Promise<void>;
+  onItemFailure?(errorText: string, info: ItemFailureInfo): void | Promise<void>;
   /**
    * Runtime alerting (backlog / DLQ change / balances / auto-funding).
-   * `gasPriceGwei` is passed only on the gas-too-high branch.
+   * Runs on EVERY cycle — including idle ones (reason "idle"), so a drained
+   * wallet or growing DLQ is discovered while the queue is quiet instead of
+   * hours later when the next user create arrives. Runtimes throttle
+   * internally. `gasPriceGwei` is passed only on the gas-too-high branch;
+   * `reason` "gas-fail" marks cycles skipped because the write RPC is
+   * unreachable (runtimes alert after several consecutive ones).
    */
-  checkAlerts?(gasPriceGwei?: number): Promise<void>;
+  checkAlerts?(gasPriceGwei: number | undefined, reason: AlertReason): Promise<void>;
+  /**
+   * A wallet nonce the unstick sweep has repeatedly failed to clear — genuine
+   * dev-intervention condition (RPC rejecting replacements / gas cap too low).
+   * Runtimes page Telegram (throttled).
+   */
+  onStuckTx?(role: NonceRole, nonce: number, attempts: number, ageMs: number): Promise<void>;
 }
 
 export interface QueueEngineDeps {
@@ -150,6 +196,24 @@ function shortMsg(err: unknown): string {
   return redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
 }
 
+// The broadcast-ledger writes must NEVER reroute a successful send/receipt into
+// the batch-failure path: a store hiccup after a good broadcast would otherwise
+// release a CONSUMED nonce and back off items whose tx is actually in flight.
+// A swallowed RECORD failure leaves a jammed nonce with no row — the sweep's
+// GAP FILL (nonces below an aged row) recovers it, and if even that can't
+// (all rows for the role lost, which implies a broader store outage that the
+// per-cycle error escalation already pages on), onItemFailure(terminal) still
+// pages once queued items EXHAUST. A swallowed DELETE failure is harmless: the
+// next sweep sees the nonce is consumed (< confirmed) and removes the row.
+async function safeRecordPending(deps: QueueEngineDeps, role: NonceRole, nonce: number, hash: `0x${string}`, sentAt: number): Promise<void> {
+  try { await deps.store.recordPendingTx(role, nonce, hash, sentAt); }
+  catch (err) { log.warn("pending-tx ledger record failed (sweep will reconcile via confirmed nonce)", { operation: "ledger", role, nonce, error: shortMsg(err) }); }
+}
+async function safeDeletePending(deps: QueueEngineDeps, role: NonceRole, nonce: number): Promise<void> {
+  try { await deps.store.deletePendingTx(role, nonce); }
+  catch (err) { log.warn("pending-tx ledger delete failed (sweep will reconcile)", { operation: "ledger", role, nonce, error: shortMsg(err) }); }
+}
+
 // ── The cycle ─────────────────────────────────────────────────────────────────
 
 /**
@@ -162,10 +226,20 @@ export async function runQueueCycle(deps: QueueEngineDeps): Promise<void> {
   const now = deps.now ?? Date.now;
   const label = deps.label ?? "[queue]";
 
-  // Skip gas price check and RPC calls if nothing to process
+  // Skip gas price check and phases if nothing to process — but STILL run the
+  // alert check: a drained wallet / growing DLQ / dead alert channel must be
+  // discovered while the queue is quiet, not hours later when the next user
+  // create arrives and silently stalls. (Runtimes throttle to one real check
+  // per ALERT_INTERVAL, so idle cycles are near-free.)
+  // Unstick FIRST — even on an otherwise-idle cycle a jammed nonce left by a
+  // now-drained queue must be cleared (it self-guards, is a no-op with an empty
+  // ledger, and never throws). Uses on-chain confirmed nonce as ground truth.
+  await unstickPendingTxs(deps, now);
+
   const pending = await deps.store.countActive();
   if (pending === 0) {
     await cleanup(deps);
+    await deps.hooks?.checkAlerts?.(undefined, "idle");
     return;
   }
 
@@ -182,13 +256,13 @@ export async function runQueueCycle(deps: QueueEngineDeps): Promise<void> {
       dependency: "rpc", operation: "getGasPrice", error_category: "transient",
       error: shortMsg(err), queue_depth: pending,
     });
-    await deps.hooks?.checkAlerts?.();
+    await deps.hooks?.checkAlerts?.(undefined, "gas-fail");
     return;
   }
 
   if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
     console.warn(`${label} Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), ${pending} items waiting`);
-    await deps.hooks?.checkAlerts?.(gasPriceGwei);
+    await deps.hooks?.checkAlerts?.(gasPriceGwei, "gas-high");
     return;
   }
 
@@ -196,7 +270,130 @@ export async function runQueueCycle(deps: QueueEngineDeps): Promise<void> {
   await processCommitted(deps, now, label);
   await processPending(deps, now, label);
   await cleanup(deps);
-  await deps.hooks?.checkAlerts?.();
+  await deps.hooks?.checkAlerts?.(undefined, "cycle-end");
+}
+
+/**
+ * Reconcile the broadcast ledger and unjam genuinely-stuck nonces.
+ *
+ * GROUND TRUTH is the on-chain confirmed nonce count, NOT the recorded tx hash.
+ * A nonce below the confirmed count is consumed — whatever tx won (the original,
+ * a cancel, or an out-of-band tx) — so its ledger row is deleted unconditionally.
+ * This is what makes the sweep zombie-proof: the earlier "did THIS hash mine?"
+ * check left a row immortal if the original landed after a cancel was broadcast
+ * (the cancel could then never mine → row never cleared → sweep budget starved).
+ *
+ * A nonce at/above the confirmed count that is still aged is genuinely pending:
+ * replace it with a same-nonce zero-value self-transfer at an escalating gas
+ * price (rises with attempts so a persistent jam eventually clears), and PAGE
+ * the operator once attempts pass a threshold — a nonce that won't clear is a
+ * dev-intervention condition. Runs every cycle incl. idle; never throws.
+ */
+async function unstickPendingTxs(deps: QueueEngineDeps, now: () => number): Promise<void> {
+  let rows: { role: NonceRole; nonce: number; hash: `0x${string}`; sentAt: number; attempts: number }[];
+  try {
+    rows = await deps.store.listPendingTxs(now() - STUCK_TX_AGE_MS);
+  } catch (err) {
+    log.warn("unstick sweep: ledger read failed", { operation: "unstick", error: shortMsg(err) });
+    return;
+  }
+  if (rows.length === 0) return; // idle / nothing aged → free
+
+  // Confirmed on-chain nonce per role (one call per role present in the ledger).
+  const confirmed: Partial<Record<NonceRole, number>> = {};
+  for (const role of new Set(rows.map((r) => r.role))) {
+    try {
+      confirmed[role] = await deps.chain.getConfirmedNonce(role);
+    } catch (err) {
+      log.warn("unstick sweep: confirmed-nonce read failed for role", { operation: "unstick", role, error: shortMsg(err) });
+      // Leave undefined → this role's rows are skipped safely this cycle.
+    }
+  }
+
+  const stuck: typeof rows = [];
+  for (const tx of rows) {
+    const c = confirmed[tx.role];
+    if (c === undefined) continue; // couldn't read — skip, retry next cycle
+    if (tx.nonce < c) {
+      // Nonce consumed — nothing is stuck here regardless of which hash won.
+      try { await deps.store.deletePendingTx(tx.role, tx.nonce); } catch { /* retry next cycle */ }
+    } else {
+      stuck.push(tx); // nonce >= confirmed AND aged → genuinely jammed
+    }
+  }
+
+  // GAP FILL: a broadcast whose ledger row was lost (a store write that
+  // safeRecordPending swallowed) leaves a jammed nonce with NO row. If aged
+  // rows sit ABOVE the confirmed nonce, the nonces between confirmed and the
+  // lowest such row are — by mempool sequencing — occupied by unmined txs; any
+  // that lack a row are exactly those lost jams. Synthesize entries so the
+  // sweep replaces them too. (Bounded to below an aged row, so we never cancel
+  // a nonce the pool is about to legitimately use.)
+  for (const role of new Set(stuck.map((r) => r.role))) {
+    const c = confirmed[role];
+    if (c === undefined) continue;
+    const known = new Set(rows.filter((r) => r.role === role).map((r) => r.nonce));
+    const lowestStuck = Math.min(...stuck.filter((r) => r.role === role).map((r) => r.nonce));
+    for (let n = c; n < lowestStuck; n++) {
+      if (!known.has(n)) {
+        stuck.push({ role, nonce: n, hash: "0x" as `0x${string}`, sentAt: now() - STUCK_TX_AGE_MS, attempts: 0 });
+      }
+    }
+  }
+  if (stuck.length === 0) return;
+
+  // Lowest nonce first — a jam is cleared from the bottom (a higher nonce can't
+  // mine until the one below it does).
+  stuck.sort((a, b) => a.nonce - b.nonce);
+
+  // Price the replacement off the CURRENT network gas, escalating with attempts.
+  let networkGwei: number;
+  try {
+    networkGwei = Number(await deps.chain.getGasPrice()) / 1e9;
+  } catch {
+    return; // can't price a cancel now — next cycle
+  }
+
+  // The cancel must respect the operator's willingness-to-pay ceiling: never
+  // spend more per-gas than the queue itself would (MAX_GAS_PRICE_GWEI). During
+  // a spike above the cap the replacement may not clear until the spike passes —
+  // that's the correct trade-off (onStuckTx pages by age below).
+  const gasCapWei = BigInt(Math.round(MAX_GAS_PRICE_GWEI * 1e9));
+
+  for (const tx of stuck.slice(0, MAX_UNSTICK_PER_CYCLE)) {
+    const attempts = tx.attempts + 1;
+    // 1.5x, 2.0x, 2.5x, … of current network price so a persistent jam clears.
+    const factorNum = CANCEL_GAS_NUM + BigInt(attempts - 1) * 50n; // 150,200,250…
+    let cancelGas = BigInt(Math.round(networkGwei * 1e9)) * factorNum / CANCEL_GAS_DEN;
+    if (cancelGas > gasCapWei) cancelGas = gasCapWei;
+    const ageMs = now() - tx.sentAt;
+    try {
+      const cancelHash = await deps.chain.sendCancel(tx.role, tx.nonce, cancelGas);
+      // Success → track the cancel (new hash, reset age, bumped attempts).
+      await deps.store.recordPendingTx(tx.role, tx.nonce, cancelHash, now(), attempts);
+      log.warn("stuck tx replaced with same-nonce cancel", {
+        operation: "unstick", outcome: "cancelled",
+        role: tx.role, nonce: tx.nonce, stuck_hash: tx.hash, cancel_hash: cancelHash,
+        attempts, stuck_age_ms: ageMs,
+      });
+    } catch (err) {
+      // Cancel rejected (e.g. "replacement underpriced" when the stuck tx paid
+      // above our gas cap). PERSIST the bumped attempt count while KEEPING the
+      // original hash/sentAt so (a) the counter still climbs → escalation fires
+      // even when cancels never land, and (b) age keeps growing.
+      try { await deps.store.recordPendingTx(tx.role, tx.nonce, tx.hash, tx.sentAt, attempts); } catch { /* retry next cycle */ }
+      log.warn("unstick attempt failed, will retry next cycle", {
+        operation: "unstick", role: tx.role, nonce: tx.nonce, attempts, error: shortMsg(err),
+      });
+    }
+    // Escalation: a nonce we've failed to clear for many attempts OR that has
+    // been stuck a long time needs a human (RPC won't accept our replacement,
+    // or the stuck tx out-prices our gas cap). Age-based too, so a cancel that
+    // is persistently REJECTED (attempts stuck low) still eventually pages.
+    if (attempts >= UNSTICK_ALERT_ATTEMPTS || ageMs >= UNSTICK_ALERT_AGE_MS) {
+      await deps.hooks?.onStuckTx?.(tx.role, tx.nonce, attempts, ageMs);
+    }
+  }
 }
 
 async function cleanup(deps: QueueEngineDeps): Promise<void> {
@@ -314,8 +511,12 @@ async function processCommitted(deps: QueueEngineDeps, now: () => number, label:
     try {
       const gasEstimate = await deps.chain.estimateBatchCreate(params);
       const hash = await deps.chain.sendBatchCreate(params, handle.nonce, gasEstimate * 120n / 100n);
+      await safeRecordPending(deps, "create", handle.nonce, hash, now());
       // Wait for receipt and verify success before marking done
       const receipt = await deps.chain.waitReceipt(hash, RECEIPT_TIMEOUT, "create");
+      // A receipt — success OR reverted — means the tx is MINED and the nonce
+      // consumed: clear the unstick ledger before acting on the outcome.
+      await safeDeletePending(deps, "create", handle.nonce);
       if (receipt.status === "reverted") {
         throw new Error(`batchCreateRecord tx reverted: ${hash}`);
       }
@@ -414,7 +615,9 @@ async function isolatePoisonCreate(deps: QueueEngineDeps, now: () => number, ite
     const handle = await deps.nonces.acquire("create");
     try {
       const hash = await deps.chain.sendBatchCreate([param], handle.nonce, gasEstimate * 120n / 100n);
+      await safeRecordPending(deps, "create", handle.nonce, hash, now());
       const receipt = await deps.chain.waitReceipt(hash, RECEIPT_TIMEOUT, "create");
+      await safeDeletePending(deps, "create", handle.nonce);
       if (receipt.status === "reverted") throw new Error(`reverted: ${hash}`);
       await deps.store.markManyDone([item.id], now(), hash);
       log.info("isolated item created individually", { job_id: item.id, operation: "batchCreateRecord", outcome: "success" });
@@ -443,8 +646,10 @@ async function processPending(deps: QueueEngineDeps, now: () => number, _label: 
   try {
     const gasEstimate = await deps.chain.estimateBatchCommit(commitments);
     const hash = await deps.chain.sendBatchCommit(commitments, handle.nonce, gasEstimate * 120n / 100n);
+    await safeRecordPending(deps, "commit", handle.nonce, hash, now());
     // Wait for receipt and verify success
     const receipt = await deps.chain.waitReceipt(hash, RECEIPT_TIMEOUT, "commit");
+    await safeDeletePending(deps, "commit", handle.nonce);
     if (receipt.status === "reverted") {
       throw new Error(`batchCommit tx reverted: ${hash}`);
     }
@@ -519,7 +724,11 @@ async function handleFailure(
       error_category: "transient", next_retry_in_s: Math.round(delay / 1000),
     });
   }
-  await deps.hooks?.onItemFailure?.(error);
+  await deps.hooks?.onItemFailure?.(error, {
+    jobId: item.id,
+    terminal,
+    poison: opts?.poison ?? false,
+  });
 }
 
 /**

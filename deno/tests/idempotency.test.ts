@@ -1,8 +1,8 @@
 import { assertEquals, assert } from "@std/assert/";
 import { initQueue, enqueue, findDuplicate, getQueueDb } from "../queue.ts";
 
-function setup() {
-  initQueue(":memory:");
+async function setup() {
+  await initQueue(":memory:");
 }
 
 const base = {
@@ -20,7 +20,7 @@ function activeCount(rpId: string, credentialId: string): number {
 }
 
 Deno.test("enqueue is idempotent: concurrent identical creates return one job", async () => {
-  setup();
+  await setup();
   const p = { rpId: "ex.com", credentialId: "c1", initialCredentialId: "c1", ...base };
   const [id1, id2] = await Promise.all([enqueue(p), enqueue(p)]);
   assertEquals(id1, id2, "both creates must resolve to the same queue id");
@@ -28,7 +28,7 @@ Deno.test("enqueue is idempotent: concurrent identical creates return one job", 
 });
 
 Deno.test("enqueue: a second create for the same key returns the existing job", async () => {
-  setup();
+  await setup();
   const p = { rpId: "ex.com", credentialId: "c2", initialCredentialId: "c2", ...base };
   const id1 = await enqueue(p);
   const id2 = await enqueue(p);
@@ -37,7 +37,7 @@ Deno.test("enqueue: a second create for the same key returns the existing job", 
 });
 
 Deno.test("enqueue: distinct credentials create distinct active rows", async () => {
-  setup();
+  await setup();
   const id1 = await enqueue({ rpId: "ex.com", credentialId: "a", initialCredentialId: "a", ...base });
   const id2 = await enqueue({ rpId: "ex.com", credentialId: "b", initialCredentialId: "b", ...base });
   assert(id1 !== id2);
@@ -46,7 +46,7 @@ Deno.test("enqueue: distinct credentials create distinct active rows", async () 
 });
 
 Deno.test("enqueue: re-create is allowed after the prior job is 'failed' (DLQ)", async () => {
-  setup();
+  await setup();
   const p = { rpId: "ex.com", credentialId: "c3", initialCredentialId: "c3", ...base };
   const id1 = await enqueue(p);
   // Move the first job to the DLQ.
@@ -60,10 +60,10 @@ Deno.test("enqueue: re-create is allowed after the prior job is 'failed' (DLQ)",
   assertEquals(newest!.status, "pending");
 });
 
-Deno.test("migration dedupe: pre-existing active duplicates are collapsed to one on init", () => {
+Deno.test("migration dedupe: pre-existing active duplicates are collapsed to one on init", async () => {
   // Build a table WITHOUT the unique index, insert duplicate active rows, then
   // re-run initQueue (which dedupes + builds the index) and assert convergence.
-  initQueue(":memory:");
+  await initQueue(":memory:");
   const db = getQueueDb();
   // Drop the unique index so we can insert duplicates the old (buggy) way.
   db.exec("DROP INDEX IF EXISTS idx_queue_active_unique");
@@ -89,8 +89,8 @@ Deno.test("migration dedupe: pre-existing active duplicates are collapsed to one
   assertEquals(survivor!.id, "dup-2", "the newest (highest createdAt) survives");
 });
 
-Deno.test("migration dedupe: a 'done' row is NEVER demoted in favor of a newer active duplicate", () => {
-  initQueue(":memory:");
+Deno.test("migration dedupe: a 'done' row is NEVER demoted in favor of a newer active duplicate", async () => {
+  await initQueue(":memory:");
   const db = getQueueDb();
   db.exec("DROP INDEX IF EXISTS idx_queue_active_unique");
   const now = Date.now();

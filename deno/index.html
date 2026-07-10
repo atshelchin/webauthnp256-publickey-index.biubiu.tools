@@ -65,7 +65,9 @@
 <p>Base URL: <code>https://webauthnp256-publickey-index.biubiu.tools</code> (or your self-hosted address)</p>
 <hr>
 <h3>GET /api/challenge</h3>
-<p>Get a random challenge (backward compatible).</p>
+<p>Get a random challenge. <strong>Compatibility endpoint</strong>: the service does not
+require or verify possession of the P256 private key on create — the challenge
+is not consumed anywhere server-side.</p>
 <p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;challenge&quot;: &quot;a1b2c3d4...&quot;
@@ -112,7 +114,7 @@
 <td>walletRef</td>
 <td>string</td>
 <td>No</td>
-<td>Wallet identifier (bytes32 hex), defaults to deterministic Safe address from publicKey</td>
+<td>Deterministic Safe address derived from publicKey (bytes32 hex). If provided it MUST equal the derived value — arbitrary values are rejected (identity-forgery guard)</td>
 </tr>
 <tr>
 <td>initialCredentialId</td>
@@ -153,8 +155,10 @@
 </code></pre>
 <p><strong>Error responses</strong>:</p>
 <ul>
-<li><code>400</code> - Missing parameters</li>
-<li><code>429</code> - Rate limit exceeded (5 requests per IP per minute)</li>
+<li><code>400</code> - Missing/invalid parameters (incl. a publicKey that is not a real point on the P-256 curve, or a walletRef that does not match the derived one)</li>
+<li><code>413</code> - Body larger than 32KB</li>
+<li><code>429</code> - Rate limit exceeded (5 creates per IP per minute)</li>
+<li><code>503</code> - Backpressure (queue too deep) or global create cap reached — retry with backoff (<code>Retry-After</code> provided)</li>
 </ul>
 <hr>
 <h3>GET /api/create/:id</h3>
@@ -346,9 +350,14 @@
   &quot;version&quot;: &quot;1.0.0&quot;,
   &quot;chainId&quot;: 100,
   &quot;contract&quot;: &quot;0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3&quot;,
-  &quot;status&quot;: &quot;ok&quot;
+  &quot;rpcCircuit&quot;: &quot;closed&quot;,
+  &quot;status&quot;: &quot;ok&quot;,
+  &quot;queue&quot;: { &quot;depth&quot;: 0, &quot;dlq&quot;: 0, &quot;oldestJobAgeMs&quot;: 0 }
 }
 </code></pre>
+<p><code>status</code> becomes <code>degraded</code> (with a <code>reasons</code> array: <code>queue-depth</code> / <code>dlq</code> /
+<code>oldest-job</code> / <code>stats-unavailable</code>) when queue thresholds trip — the service is
+still serving; route monitoring accordingly.</p>
 <hr>
 <h3>GET /</h3>
 <p>Returns an HTML-rendered version of this documentation (GitHub style).</p>
@@ -417,7 +426,7 @@ build.ts                     Build script (README → HTML + compile binary)
 <h2>Local Development</h2>
 <pre><code class="language-bash"># Deno
 deno task dev          # Hot-reload dev (auto-loads .env)
-deno task test         # Run tests (69 tests)
+deno task test         # Offline suite (live-chain tests gated behind RUN_LIVE_TESTS / PRIVATE_KEY / RUN_PERF)
 
 # Cloudflare Worker
 npm install            # Install dependencies
@@ -434,9 +443,14 @@ deno task deploy rollback     # Rollback to previous version
 <h3>Server Environment Variables</h3>
 <pre><code class="language-env">PORT=11256
 QUEUE_DB_PATH=/opt/webauthnp256-publickey-index/data/queue.db
-PRIVATE_KEY=0x...
-TELEGRAM_BOT_TOKEN=
+PRIVATE_KEY=0x...            # 0x + 64 hex; startup fails fast otherwise
+ALCHEMY_API_KEY=             # optional priority write RPC
+TELEGRAM_BOT_TOKEN=          # strongly recommended: all operator alerts
 TELEGRAM_CHAT_ID=
+CACHE_MAX_MB=32              # optional
+GLOBAL_WRITE_LIMIT=40        # optional: global creates/min cap
+LOG_LEVEL=info               # optional: debug|info|warn|error
+# QUEUE_WORKER=0             # dev only: disable on-chain processing
 </code></pre>
 <h2>Deploy (Cloudflare Workers)</h2>
 <pre><code class="language-bash">npm install                                    # Install dependencies

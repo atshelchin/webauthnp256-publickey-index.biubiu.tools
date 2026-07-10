@@ -161,5 +161,24 @@ export function createViemChainOps(getCfg: () => AppConfig): ChainOps {
       const receipt = await client.waitForTransactionReceipt({ hash, timeout: timeoutMs });
       return { status: receipt.status === "reverted" ? "reverted" : "success" };
     },
+
+    async getConfirmedNonce(role): Promise<number> {
+      // "latest" (mined) count — the sweep's ground truth for "is this nonce
+      // consumed?". Distinct from the nonce POOL which tracks "pending".
+      const { wallet, client } = walletFor(role);
+      return await client.getTransactionCount({ address: wallet.account.address, blockTag: "latest" });
+    },
+
+    async sendCancel(role, nonce, gasPrice): Promise<`0x${string}`> {
+      // Zero-value self-transfer at the SAME nonce with an explicit (bumped)
+      // gas price — the canonical way to replace/unjam a stuck tx.
+      const { wallet } = walletFor(role);
+      return await wallet.sendTransaction({
+        to: wallet.account.address,
+        value: 0n,
+        nonce,
+        gasPrice,
+      });
+    },
   };
 }

@@ -19,10 +19,11 @@ import {
   getCommitWallet,
   sendTelegram,
 } from "../shared/queue.ts";
-import { runQueueCycle, type QueueStore } from "../shared/queue-engine.ts";
+import { runQueueCycle, type QueueStore, type AlertReason, type ItemFailureInfo } from "../shared/queue-engine.ts";
 import { createViemChainOps } from "../shared/chain-viem.ts";
 import { createNonceManager } from "../shared/nonce.ts";
 import { buildConfig } from "./config.ts";
+import { initQueue, withD1Retry } from "./queue.ts";
 import { log, redactSecrets } from "../shared/log.ts";
 import type { Env } from "./types.ts";
 
@@ -45,6 +46,14 @@ export class QueueProcessor implements DurableObject {
   private lastAlertAt = 0;
   private lastFailedCount = 0;
   private failuresSinceLastAlert = 0;
+  private lastTerminalAlertAt = 0;
+  private terminalSinceLastAlert = 0;
+  private lastTerminalError = "";
+  private consecutiveGasFails = 0;
+  private lastRpcUnreachableAlertAt = 0;
+  private consecutiveAlarmErrors = 0;
+  private lastAlarmErrorAlertAt = 0;
+  private lastStuckAlertAt = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -71,9 +80,21 @@ export class QueueProcessor implements DurableObject {
     const start = Date.now();
     try {
       await this.processQueue();
+      this.consecutiveAlarmErrors = 0;
       log.info("queue alarm cycle done", { operation: "processQueue", latency_ms: Date.now() - start, outcome: "success" });
     } catch (err) {
       log.error("queue alarm cycle error", { operation: "processQueue", latency_ms: Date.now() - start, error: shortMsg(err) });
+      // A throwing cycle (bug / broken migration / D1 down) never reaches
+      // checkAlerts — page after several consecutive so a halted queue always
+      // reaches Telegram.
+      this.consecutiveAlarmErrors++;
+      if (this.consecutiveAlarmErrors >= 3 && Date.now() - this.lastAlarmErrorAlertAt >= 5 * 60_000) {
+        this.lastAlarmErrorAlertAt = Date.now();
+        try {
+          const config = await this.getConfig();
+          await sendTelegram(config, `🛑 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\nDO alarm cycle FAILING (${this.consecutiveAlarmErrors} consecutive) — creates NOT processed.\nLatest: ${shortMsg(err)}`);
+        } catch { /* config/telegram unavailable — nothing more we can do here */ }
+      }
     }
     // Always re-schedule — a failed/slow cycle must never leave the alarm unset
     // (that would silently stop all queue processing).
@@ -88,12 +109,38 @@ export class QueueProcessor implements DurableObject {
     return await buildConfig(this.env);
   }
 
+  private migrated = false;
+  private async ensureMigrated(): Promise<void> {
+    if (!this.migrated) {
+      await initQueue(this.db);
+      this.migrated = true;
+    }
+  }
+
   private async processQueue(): Promise<void> {
     const config = await this.getConfig();
     if (!config.privateKey) {
       console.warn("[queue-processor] No PRIVATE_KEY configured, skipping");
+      // Accepting creates we can never process is a dev-intervention condition:
+      // page if anything is actually queued (throttled via checkAlerts).
+      try {
+        await this.ensureMigrated();
+        const active = await this.db.prepare(
+          "SELECT COUNT(*) as c FROM create_queue WHERE status IN ('pending','committed','creating')"
+        ).first<{ c: number }>();
+        if (active && active.c > 0 && Date.now() - this.lastAlarmErrorAlertAt >= 5 * 60_000) {
+          this.lastAlarmErrorAlertAt = Date.now();
+          await sendTelegram(config, `🔑 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\nNO SIGNER (PRIVATE_KEY) configured but ${active.c} create(s) are queued — they will NEVER complete. Set the secret and redeploy.`);
+        }
+      } catch { /* best-effort */ }
       return;
     }
+
+    // The DO runs in its OWN isolate: after a fresh deploy the cron→alarm path
+    // can fire BEFORE any fetch isolate has run initQueue, so a new migration's
+    // table (e.g. pending_txs) would not exist yet and the cycle's ledger
+    // writes would fail. Cheap when current (2 statements), once per instance.
+    await this.ensureMigrated();
 
     await runQueueCycle({
       store: this.makeStore(),
@@ -106,8 +153,13 @@ export class QueueProcessor implements DurableObject {
         },
       },
       hooks: {
-        onItemFailure: (error) => this.onItemFailure(error),
-        checkAlerts: (gasPriceGwei?: number) => this.checkAlerts(config, gasPriceGwei),
+        onItemFailure: (error, info) => this.onItemFailure(error, info),
+        checkAlerts: (gasPriceGwei, reason) => this.onCheckAlerts(config, gasPriceGwei, reason),
+        onStuckTx: async (role, nonce, attempts, ageMs) => {
+          if (Date.now() - this.lastStuckAlertAt < 5 * 60_000) return;
+          this.lastStuckAlertAt = Date.now();
+          await sendTelegram(config, `🧵 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\nWallet nonce STUCK: role=${role} nonce=${nonce} not clearing after ${attempts} attempts (${Math.round(ageMs / 60_000)}min). Creates behind it are blocked — check RPC acceptance / MAX_GAS_PRICE_GWEI.`);
+        },
       },
       label: "[queue-processor]",
     });
@@ -171,11 +223,43 @@ export class QueueProcessor implements DurableObject {
         const result = await db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").bind(doneBefore).run();
         return { doneDeleted: result.meta.changes ?? 0 };
       },
+      async recordPendingTx(role, nonce, hash, sentAt, attempts = 0): Promise<void> {
+        await withD1Retry(() => db.prepare("INSERT OR REPLACE INTO pending_txs (role, nonce, hash, sentAt, attempts) VALUES (?, ?, ?, ?, ?)")
+          .bind(role, nonce, hash, sentAt, attempts).run());
+      },
+      async deletePendingTx(role, nonce): Promise<void> {
+        await db.prepare("DELETE FROM pending_txs WHERE role = ? AND nonce = ?").bind(role, nonce).run();
+      },
+      async listPendingTxs(sentBefore) {
+        const { results } = await withD1Retry(() => db.prepare(
+          "SELECT role, nonce, hash, sentAt, attempts FROM pending_txs WHERE sentAt < ? ORDER BY nonce ASC"
+        ).bind(sentBefore).all<{ role: "create" | "commit"; nonce: number; hash: `0x${string}`; sentAt: number; attempts: number }>());
+        return results;
+      },
     };
   }
 
-  /** Engine hook: batched operator alert for item failures. */
-  private async onItemFailure(error: string): Promise<void> {
+  /**
+   * Engine hook. Terminal (DLQ) quarantines mean a user's create will NOT
+   * complete without a developer (POISON = code/data bug, EXHAUSTED = outage
+   * outlived retries) — they page IMMEDIATELY (one aggregate message per
+   * minute). Non-terminal failures use the batched counter as before.
+   */
+  private async onItemFailure(error: string, info: ItemFailureInfo): Promise<void> {
+    if (info.terminal) {
+      this.terminalSinceLastAlert++;
+      this.lastTerminalError = `${info.poison ? "POISON" : "EXHAUSTED"} (job ${info.jobId}): ${error}`;
+      const now = Date.now();
+      if (now - this.lastTerminalAlertAt >= 60_000) {
+        this.lastTerminalAlertAt = now;
+        const n = this.terminalSinceLastAlert;
+        this.terminalSinceLastAlert = 0;
+        const config = await this.getConfig();
+        const kind = info.poison ? "code/data bug" : "outage exhausted retries";
+        await sendTelegram(config, `🚨 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${n} create request(s) QUARANTINED to DLQ — developer intervention required (${kind}).\nLatest: ${this.lastTerminalError}\nReplay after fixing: see 06-operations-runbook.md`);
+      }
+      return;
+    }
     this.failuresSinceLastAlert++;
     if (this.failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
       const config = await this.getConfig();
@@ -184,6 +268,37 @@ export class QueueProcessor implements DurableObject {
       await sendTelegram(config, `🔴 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${this.failuresSinceLastAlert} tx failures\nTotal in DLQ (failed): ${failed?.count ?? 0}\nLatest: ${error}`);
       this.failuresSinceLastAlert = 0;
     }
+  }
+
+  /**
+   * Consecutive gas-check failures = write RPC face unreachable = creates NOT
+   * progressing. Page explicitly after 3 cycles (throttled 5 min), then run
+   * the regular alert sweep.
+   */
+  private async flushTerminalAlerts(config: AppConfig): Promise<void> {
+    if (this.terminalSinceLastAlert > 0 && Date.now() - this.lastTerminalAlertAt >= 60_000) {
+      this.lastTerminalAlertAt = Date.now();
+      const n = this.terminalSinceLastAlert;
+      this.terminalSinceLastAlert = 0;
+      await sendTelegram(config, `🚨 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${n} create request(s) QUARANTINED to DLQ — developer intervention required.\nLatest: ${this.lastTerminalError}\nReplay after fixing: see 06-operations-runbook.md`);
+    }
+  }
+
+  private async onCheckAlerts(config: AppConfig, gasPriceGwei: number | undefined, reason: AlertReason): Promise<void> {
+    await this.flushTerminalAlerts(config);
+    if (reason === "gas-fail") {
+      this.consecutiveGasFails++;
+      if (this.consecutiveGasFails >= 3 && Date.now() - this.lastRpcUnreachableAlertAt >= 5 * 60_000) {
+        this.lastRpcUnreachableAlertAt = Date.now();
+        const pending = await this.db.prepare(
+          "SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')"
+        ).first<{ count: number }>();
+        await sendTelegram(config, `🔌 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\nWrite RPC unreachable for ${this.consecutiveGasFails} consecutive cycles — creates are NOT being processed (${pending?.count ?? "?"} queued). Endpoints rotate automatically; if this persists check RPC providers / ALCHEMY_API_KEY.`);
+      }
+    } else {
+      this.consecutiveGasFails = 0;
+    }
+    await this.checkAlerts(config, gasPriceGwei);
   }
 
   private async checkAlerts(config: AppConfig, gasPriceGwei?: number): Promise<void> {
@@ -228,7 +343,8 @@ export class QueueProcessor implements DurableObject {
         const commitBalance = await client.getBalance({ address: commitWallet.account.address });
         const commitBalanceXdai = Number(commitBalance) / 1e18;
         if (commitBalanceXdai < FUND_THRESHOLD) {
-          await this.ensureCommitWalletFunded(config);
+          const fundingIssue = await this.ensureCommitWalletFunded(config);
+          if (fundingIssue) alerts.push(fundingIssue);
         }
       }
     } catch (err) { console.warn(`[queue-processor] checkAlerts gas/balance check failed:`, shortMsg(err)); }
@@ -238,17 +354,26 @@ export class QueueProcessor implements DurableObject {
     }
   }
 
-  private async ensureCommitWalletFunded(config: AppConfig): Promise<void> {
+  /**
+   * Top up the commit wallet from the create wallet when low. Returns an
+   * operator-actionable alert string when developer intervention is required
+   * (top-up needed / funding failing) — "needs money" must never be console-only.
+   */
+  private async ensureCommitWalletFunded(config: AppConfig): Promise<string | null> {
     try {
       const { wallet: createWallet, client } = getCreateWallet(config);
       const { wallet: commitWallet } = getCommitWallet(config);
-      if (commitWallet.account.address === createWallet.account.address) return;
+      if (commitWallet.account.address === createWallet.account.address) return null;
 
       const commitBalance = await client.getBalance({ address: commitWallet.account.address });
-      if (Number(commitBalance) / 1e18 >= FUND_THRESHOLD) return;
+      if (Number(commitBalance) / 1e18 >= FUND_THRESHOLD) return null;
 
       const mainBalance = await client.getBalance({ address: createWallet.account.address });
-      if (Number(mainBalance) / 1e18 < FUND_AMOUNT + GAS_BALANCE_THRESHOLD) return;
+      const mainBalanceXdai = Number(mainBalance) / 1e18;
+      if (mainBalanceXdai < FUND_AMOUNT + GAS_BALANCE_THRESHOLD) {
+        console.warn(`[queue-processor] Cannot fund commit wallet: main balance too low (${mainBalanceXdai.toFixed(6)} xDAI)`);
+        return `🪫 TOP-UP REQUIRED: cannot auto-fund commit wallet — create wallet ${createWallet.account.address} has only ${mainBalanceXdai.toFixed(6)} xDAI (needs ≥ ${(FUND_AMOUNT + GAS_BALANCE_THRESHOLD).toFixed(3)}). Creates will stall when it runs out.`;
+      }
 
       const hash = await createWallet.sendTransaction({
         to: commitWallet.account.address,
@@ -259,8 +384,10 @@ export class QueueProcessor implements DurableObject {
         throw new Error(`Fund tx reverted: ${hash}`);
       }
       console.log(`[queue-processor] Commit wallet funded: ${hash}`);
+      return null;
     } catch (err) {
       console.warn(`[queue-processor] Auto-fund failed:`, shortMsg(err));
+      return `⚠️ Commit wallet auto-fund FAILED: ${shortMsg(err)} — check wallet balances / RPC.`;
     }
   }
 }

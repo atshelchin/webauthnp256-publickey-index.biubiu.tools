@@ -78,12 +78,12 @@ async function ensureConfig() {
 
 const E2E_DB_PATH = "/tmp/e2e-test-queue.db";
 
-function setupChainTest() {
+async function setupChainTest() {
   // Use disk-based SQLite for realistic throughput measurement
   try { Deno.removeSync(E2E_DB_PATH); } catch { /* ok if missing */ }
   try { Deno.removeSync(E2E_DB_PATH + "-shm"); } catch { /* ok */ }
   try { Deno.removeSync(E2E_DB_PATH + "-wal"); } catch { /* ok */ }
-  initQueue(E2E_DB_PATH);
+  await initQueue(E2E_DB_PATH);
   cacheClear();
   if (!workerStarted) {
     startQueueWorker();
@@ -95,6 +95,9 @@ function setupChainTest() {
 
 Deno.test({
   name: "PERF: SQLite enqueue throughput (1000 items)",
+  // Gated: 1000 WebCrypto keygens + a disk DB in the repo root on every test
+  // run slowed the suite and polluted the tree (docs 08 P2-11).
+  ignore: !Deno.env.get("RUN_PERF"),
   sanitizeOps: false,
   sanitizeResources: false,
   async fn() {
@@ -103,7 +106,7 @@ Deno.test({
     try { Deno.removeSync(perfDb); } catch { /* ok */ }
     try { Deno.removeSync(perfDb + "-shm"); } catch { /* ok */ }
     try { Deno.removeSync(perfDb + "-wal"); } catch { /* ok */ }
-    initQueue(perfDb);
+    await initQueue(perfDb);
 
     const count = 1000;
     const items: { publicKey: string; credentialId: string; name: string }[] = [];
@@ -154,7 +157,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await ensureConfig();
-    setupChainTest();
+    await setupChainTest();
 
     const publicKey = await generateP256PublicKeyHex();
     const credentialId = crypto.randomUUID();
@@ -216,7 +219,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await ensureConfig();
-    setupChainTest();
+    await setupChainTest();
 
     const count = 5;
     const items: { publicKey: string; credentialId: string; name: string }[] = [];
@@ -268,7 +271,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await ensureConfig();
-    setupChainTest();
+    await setupChainTest();
 
     const publicKey = await generateP256PublicKeyHex();
     const credentialId = crypto.randomUUID();
@@ -304,7 +307,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await ensureConfig();
-    setupChainTest();
+    await setupChainTest();
 
     const publicKey = await generateP256PublicKeyHex();
     const credentialId = crypto.randomUUID();

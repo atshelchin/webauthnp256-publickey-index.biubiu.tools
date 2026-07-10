@@ -24,9 +24,29 @@
 
 **当前没有指标系统(Prometheus 等)**。最小监控建议:外部拨测 /api/health 每分钟,`status!="ok"` 连续 3 次告警;Telegram 告警作为兜底通道。
 
-## Telegram 告警(已内建)
+## Telegram 告警覆盖矩阵(2026-07 整改后)
 
-5 分钟节流(`ALERT_INTERVAL`),触发项:队列积压 ≥100;DLQ 数量变化;create 钱包余额 <0.01 xDAI;gas 价 >0.1 Gwei(队列暂停);每累计 10 次 tx 失败。发送 5s 超时、best-effort——**Telegram 挂了不影响业务,但也意味着告警会静默丢失**(改进项见 08)。
+**设计原则(运营者指令):任何需要开发者干预的情况——代码 bug 或需要充钱——必须到 Telegram。** 空闲周期也跑告警检查(节流 5 分钟),钱包被掏空不再等到下一个用户 create 才被发现。
+
+| 条件 | 含义 | 告警 | 节流 |
+|---|---|---|---|
+| 🚨 POISON 入 DLQ | **代码/数据 bug**,该 create 永不完成 | 即时(聚合) | 60s |
+| 🚨 EXHAUSTED 入 DLQ | 故障期耗尽 10 次重试 | 即时(聚合) | 60s |
+| 🪫 create 钱包余额低 | **需要充钱** | checkAlerts(含空闲) | 5min |
+| 🪫 无法自动充值 commit 钱包(主钱包太穷) | **需要充钱** | checkAlerts + 启动时 | 5min |
+| ⚠️ 自动充值交易失败 | 检查余额/RPC | checkAlerts | 5min |
+| ⛽ gas 价超限队列暂停 | 等待或调参 | checkAlerts(两运行时) | 5min |
+| ⚠️ 队列积压 ≥100 | 排水跟不上 | checkAlerts | 5min |
+| 🔴 DLQ 数量变化 | 有新失败 | checkAlerts | 5min |
+| 🔌 写 RPC 连续 ≥3 轮不可达 | creates 不在处理 | 专用告警 | 5min |
+| 🛑 队列 cycle 卡死 >3min | worker 停摆 | 专用告警 | 3min |
+| 🛑 systemd 单元 FAILED(进程死/重启限流) | 服务下线 | **OnFailure 单元直连 curl**(进程外!) | — |
+| 每累计 10 次非终态 tx 失败 | 抖动异常多 | 批量告警 | 按次数 |
+| Telegram 自身投递失败 | 告警通道坏 | `log.warn`(journald 可见) | — |
+
+CF 侧:同矩阵(OnFailure 除外——平台自管进程;DO alarm 停摆由每分钟 cron 重新武装兜底)。
+
+**卡单交易自动解堵(不再需要人工)**:每笔广播记入 `pending_txs` 账本;>2min 无回执的交易被同 nonce、150% gas 的自转账 cancel 替换,自动解除钱包 nonce 堵塞。日志 `stuck tx replaced with same-nonce cancel` 可查;若反复失败会持续以更新价重试并留在账本。
 
 ## 常见故障分诊
 
@@ -77,6 +97,10 @@ Deno 侧 systemd `MemoryMax=256M`,进程内缓存上限 100MB(近似 LRU)。OOM 
 ## 数据备份(当前缺失,接管后应尽快落实)
 
 建议(Deno 侧):cron 每小时 `sqlite3 queue.db ".backup /backup/queue-$(date +%H).db"`(WAL 模式在线备份安全)。丢库的实际损失仅"未上链的排队项"(链上数据是权威源),故 RPO 1h 可接受。CF 侧 D1 有 Time Travel(30 天),`npx wrangler d1 time-travel` 可恢复。
+
+## 剩余人工项(代码侧无法替代)
+
+- **外部拨测**:所有进程内告警在进程死后依赖 OnFailure 单元;再加一层独立拨测 `/api/health`(如 UptimeRobot/cron 异机)才是完整闭环。`status:"degraded"` 带 `reasons[]`(queue-depth/dlq/oldest-job/stats-unavailable)可路由。
 
 ## 密钥轮换流程
 

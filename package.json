@@ -4,10 +4,12 @@
   "scripts": {
     "setup": "bash scripts/cf-setup.sh",
     "test": "vitest run",
-    "dev": "wrangler dev -c wrangler.json",
-    "deploy": "wrangler deploy -c wrangler.json"
+    "dev": "wrangler dev -c wrangler.jsonc",
+    "deploy": "wrangler deploy -c wrangler.jsonc",
+    "typecheck": "tsc -p tsconfig.worker.json"
   },
   "dependencies": {
+    "@noble/curves": "^1.4.0",
     "viem": "^2.0.0"
   },
   "overrides": {
@@ -16,6 +18,7 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.41",
     "@cloudflare/workers-types": "^4.20241205.0",
+    "typescript": "^7.0.2",
     "vitest": "~2.1.0",
     "wrangler": "^3.100.0"
   }

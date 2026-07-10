@@ -6,7 +6,8 @@
     "viem/chains": "npm:viem@2/chains",
     "@std/assert/": "jsr:@std/assert@1/",
     "@std/assert": "jsr:@std/assert@1",
-    "marked": "npm:marked@17"
+    "marked": "npm:marked@17",
+    "@noble/curves/nist": "npm:@noble/curves@1/nist"
   },
   "tasks": {
     "dev": "QUEUE_WORKER=0 deno run --watch --allow-net --allow-read=. --allow-write=. --allow-env --unstable-node-globals --env deno/index.ts",
