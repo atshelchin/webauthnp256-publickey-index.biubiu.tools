@@ -113,19 +113,8 @@ safety net of the retired Deno/CF-Worker service:
 
 Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable delivery; without them the
 alerts are logged instead. Set RELEASE to include a build tag in the heartbeat.
-
-### External liveness watchdog
-
-Every alert above is emitted by the VPS process itself, so a dead host is
-silent. The `watchdog` binary is a separate, off-host probe that pages Telegram
-when the public health endpoint is sustainedly down and confirms life daily.
-Deploy it on independent infrastructure:
-
-~~~sh
-WATCHDOG_TARGET_URL=https://your-host/api/health \
-TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
-  cargo run --release --bin watchdog
-~~~
+The daily heartbeat doubles as a liveness signal: if it stops arriving, the
+process, its chain reads, or the Telegram path is broken.
 
 ## End-to-end tests
 
@@ -157,3 +146,20 @@ Build a release binary for the target architecture and install it as
 /opt/webauthnp256-publickey-index/current/p256-index-server. The supplied
 systemd unit reads /opt/webauthnp256-publickey-index/data/.env; it does not
 install or invoke Deno, Node, npm, Wrangler, SQLite, or Cloudflare services.
+
+Tagged releases (push a v* tag) also publish per-platform binary archives and a
+multi-arch Docker image via .github/workflows/release.yml. The Docker jobs need
+the repository variable DOCKERHUB_USERNAME and secret DOCKERHUB_TOKEN.
+
+## Docker / Compose
+
+The service alone runs in a container (Redis and Iggy stay external, as with the
+prior deployments). compose.yaml builds p256-index-server/Dockerfile and reads
+p256-index-server/.env:
+
+~~~sh
+docker compose up --build
+~~~
+
+When Redis and Iggy run on the Docker host, point P256_INDEX_REDIS_URL and
+P256_INDEX_IGGY_URL at host.docker.internal (see the note in compose.yaml).

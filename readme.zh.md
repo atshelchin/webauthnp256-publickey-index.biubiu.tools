@@ -35,7 +35,7 @@ SHA-256(PRIVATE_KEY bytes) 推导，因此与原链上流程一致。
 - commit 批次 poison 隔离：把确定性 revert 的单条 commitment 单独隔离，其余继续推进。
 
 配置 TELEGRAM_BOT_TOKEN 与 TELEGRAM_CHAT_ID 后才会真正投递，否则只记日志。
-外部存活 watchdog 是独立二进制（`cargo run --bin watchdog`），需部署在被监控主机之外。
+每日心跳同时是存活信号：若心跳停止到达，说明进程、链读取或 Telegram 通道出了问题。
 
 ## 本地检查
 

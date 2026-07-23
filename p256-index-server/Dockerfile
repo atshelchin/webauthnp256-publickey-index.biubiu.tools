@@ -1,6 +1,23 @@
-FROM ubuntu:24.04
+# syntax=docker/dockerfile:1
 
-ARG DEBIAN_FRONTEND=noninteractive
+FROM rust:1-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        build-essential \
+        cmake \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release --locked --bin p256-index-server
+
+
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -10,8 +27,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid p256 --create-home --shell /usr/sbin/nologin p256 \
     && rm -rf /var/lib/apt/lists/*
 
-# The release workflow supplies the matching native Linux executable at this path.
-COPY --chmod=0555 dist/p256-index-server /usr/local/bin/p256-index-server
+COPY --from=builder /build/target/release/p256-index-server /usr/local/bin/p256-index-server
 
 USER p256
 

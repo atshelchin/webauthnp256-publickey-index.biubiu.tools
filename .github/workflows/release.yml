@@ -62,10 +62,10 @@ jobs:
             p256-index-server/target
           key: release-${{ matrix.target }}-${{ hashFiles('p256-index-server/Cargo.lock') }}
 
-      - name: Build release executables
+      - name: Build release executable
         run: cargo build --release --locked --manifest-path p256-index-server/Cargo.toml --target ${{ matrix.target }}
 
-      - name: Package executables
+      - name: Package executable
         id: package
         shell: bash
         env:
@@ -79,9 +79,7 @@ jobs:
           fi
 
           mkdir -p dist/package
-          for exe in p256-index-server watchdog; do
-            cp "p256-index-server/target/${TARGET}/release/${exe}${suffix}" "dist/package/${exe}${suffix}"
-          done
+          cp "p256-index-server/target/${TARGET}/release/p256-index-server${suffix}" "dist/package/p256-index-server${suffix}"
           asset="p256-index-server-${GITHUB_REF_NAME}-${TARGET}"
 
           if [[ "$ARCHIVE" == "zip" ]]; then
@@ -128,20 +126,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download matching Linux executables
+      - name: Download matching Linux executable
         uses: actions/download-artifact@v4
         with:
           name: p256-index-server-${{ github.ref_name }}-${{ matrix.target }}
           path: dist/artifact
 
-      - name: Extract Linux executables
+      - name: Extract Linux executable
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           tar -xzf "dist/artifact/p256-index-server-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C dist
-          chmod 0555 dist/p256-index-server dist/watchdog
+          chmod 0555 dist/p256-index-server
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
