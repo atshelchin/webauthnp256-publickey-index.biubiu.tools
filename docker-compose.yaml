@@ -1,9 +1,9 @@
 name: p256-index
 
 # Runs only the HTTP/queue service. Redis and Iggy are treated as external
-# dependencies (like the retired Vela Relay compose): point P256_INDEX_REDIS_URL
-# and P256_INDEX_IGGY_URL in ./p256-index-server/.env at them. When they run on
-# the Docker host, use host.docker.internal instead of 127.0.0.1 — e.g.
+# dependencies: point P256_INDEX_REDIS_URL and P256_INDEX_IGGY_URL in
+# ./p256-index-server/.env at them. When they run on the Docker host, use
+# host.docker.internal instead of 127.0.0.1 — e.g.
 #   P256_INDEX_REDIS_URL=redis://host.docker.internal:6379/0
 #   P256_INDEX_IGGY_URL=iggy+tcp://iggy:pass@host.docker.internal:5100
 

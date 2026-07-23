@@ -1,8 +1,7 @@
 # WebAuthn P256 Public Key Index Service
 
-The WebAuthn P256 Public Key Index is a REST service for the Gnosis-chain V2
-contract. It is now a single Rust service; the Deno runtime and Cloudflare
-Worker implementation have been removed.
+The WebAuthn P256 Public Key Index is a single Rust service exposing a REST API
+for the Gnosis-chain V2 contract.
 
 | Contract | Gnosis address |
 | --- | --- |
@@ -94,8 +93,8 @@ outages, and the pending → committed → done | failed status machine.
 
 ## Reliability and alerting
 
-The queue worker runs alongside a maintenance loop that ports the operational
-safety net of the retired Deno/CF-Worker service:
+The queue worker runs alongside a maintenance loop that provides the operational
+safety net for an unattended, fund-spending queue:
 
 - Daily heartbeat to Telegram (queue depth, DLQ, create/commit wallet balances,
   funding runway, uptime): a silent channel becomes a signal.
@@ -118,8 +117,8 @@ process, its chain reads, or the Telegram path is broken.
 
 ## End-to-end tests
 
-Contract- and chain-level parity with the retired implementations is covered by
-gated integration tests (kept out of CI, which has no infrastructure):
+Contract- and chain-level behavior is covered by gated integration tests (kept
+out of CI, which has no infrastructure):
 
 ~~~sh
 # HTTP + queue contract against real Redis and Iggy:
@@ -132,20 +131,17 @@ P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored \
   e2e_chain_tests::create_persists_on_chain_end_to_end
 ~~~
 
-## Cutover
+## Operational notes
 
-This change deliberately has no SQLite, D1, Deno, or Cloudflare Worker
-compatibility layer. Before production cutover, stop every legacy writer using
-the existing PRIVATE_KEY to avoid nonce contention; preserve its old queue file
-only as an audit artifact. Start the Rust service with Redis and Iggy, then
-confirm /api/health and a read-only query before enabling writes.
+Only one writer may use a given PRIVATE_KEY at a time: a second concurrent
+writer with the same key causes nonce contention. Start the service with Redis
+and Iggy, then confirm /api/health and a read-only query before enabling writes.
 
 ## Deployment
 
 Build a release binary for the target architecture and install it as
 /opt/webauthnp256-publickey-index/current/p256-index-server. The supplied
-systemd unit reads /opt/webauthnp256-publickey-index/data/.env; it does not
-install or invoke Deno, Node, npm, Wrangler, SQLite, or Cloudflare services.
+systemd unit reads /opt/webauthnp256-publickey-index/data/.env.
 
 Tagged releases (push a v* tag) also publish per-platform binary archives and a
 multi-arch Docker image via .github/workflows/release.yml. The Docker jobs need
@@ -153,8 +149,8 @@ the repository variable DOCKERHUB_USERNAME and secret DOCKERHUB_TOKEN.
 
 ## Docker / Compose
 
-The service alone runs in a container (Redis and Iggy stay external, as with the
-prior deployments). compose.yaml builds p256-index-server/Dockerfile and reads
+The service alone runs in a container (Redis and Iggy stay external).
+docker-compose.yaml builds p256-index-server/Dockerfile and reads
 p256-index-server/.env:
 
 ~~~sh
@@ -162,4 +158,4 @@ docker compose up --build
 ~~~
 
 When Redis and Iggy run on the Docker host, point P256_INDEX_REDIS_URL and
-P256_INDEX_IGGY_URL at host.docker.internal (see the note in compose.yaml).
+P256_INDEX_IGGY_URL at host.docker.internal (see the note in docker-compose.yaml).
